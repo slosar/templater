@@ -107,9 +107,12 @@ def parse_args() -> argparse.Namespace:
                             'Use e.g. 1.0 for an uninformative prior.')
     prior.add_argument('--zerr-floor', type=float, default=1e-4,
                        help='Minimum zerr (guards against division by zero)')
-    prior.add_argument('--disable-z-prior', action='store_true',
-                       help='Disable redshift prior: sets z_prior=(zmin+zmax)/2 and zerr=100 '
-                            'for all galaxies, making the prior essentially flat.')
+    prior.add_argument('--disable-z-prior', type=float, default=0.0,
+                       metavar='FRACTION',
+                       help='Fraction of galaxies per batch whose z prior is disabled '
+                            '(z_prior set to (zmin+zmax)/2, zerr=100). '
+                            '0.0 = all use catalog prior; 1.0 = all disabled. '
+                            'E.g. 0.99 disables 99%% of galaxies each step.')
 
     # ---- Checkpointing -------------------------------------------------------
     ckpt = p.add_argument_group("Checkpoints")
@@ -253,12 +256,13 @@ def main() -> None:
         for batch in loader:
             flux = jnp.array(batch['flux'].numpy())
             ivar = jnp.array(batch['ivar'].numpy())
-            if args.disable_z_prior:
-                z_prior = jnp.full((args.batch_size,), (args.zmin + args.zmax) / 2.0)
-                zerr = jnp.full((args.batch_size,), 100.0)
-            else:
-                z_prior = jnp.array(batch['z'].numpy())
-                zerr = _get_zerr(batch, args)
+            z_prior = jnp.array(batch['z'].numpy())
+            zerr = _get_zerr(batch, args)
+            if args.disable_z_prior > 0.0:
+                mask = np.random.random(args.batch_size) < args.disable_z_prior
+                z_center = (args.zmin + args.zmax) / 2.0
+                z_prior = jnp.where(mask, z_center, z_prior)
+                zerr = jnp.where(mask, 100.0, zerr)
 
             params, opt_state, loss_val = train_step(
                 params, opt_state, flux, ivar, z_prior, zerr
