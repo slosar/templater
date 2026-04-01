@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
 
     # ---- Data ----------------------------------------------------------------
     data = p.add_argument_group("Data")
-    data.add_argument('--spectra-dir', default='spectra/',
+    data.add_argument('--spectra-dir', default='spectra_shuffled/',
                       help='Directory containing spec-*.fits files')
     data.add_argument('--zerr-catalog', default='metadata/desi-galaxy-cat-zerr.fits',
                       help='Path to FITS catalog with targetid and zerr columns')
@@ -84,10 +84,27 @@ def parse_args() -> argparse.Namespace:
                          help='Number of points in the z search grid')
     model_g.add_argument('--Nnz', type=int, default=50,
                          help='Number of bins in the n(z) distribution')
+    model_g.add_argument('--template-res-boost', type=float, default=1.0,
+                         help='Divide the template pixel spacing by this factor, '
+                              'increasing template resolution. 1.0 = native pixel scale.')
+    model_g.add_argument('--nz-sigma', type=float, default=0.4,
+                         help='Width of initial n(z) Gaussian as a fraction of the z range. '
+                              'E.g. 0.05 with z=[0.4,1.1] gives sigma=0.035 in redshift. '
+                              'Set 0 for uniform initialisation.')
 
     # ---- Training ------------------------------------------------------------
     train = p.add_argument_group("Training")
     train.add_argument('--n-epochs', type=int, default=20, help='Number of training epochs')
+    train.add_argument('--freeze-templates', action='store_true',
+                       help='Hold templates fixed; only optimise n(z). '
+                            'Uses a masked optimizer so T receives no gradient updates.')
+    train.add_argument('--nz-steps', type=int, default=0,
+                       help='Extra n(z)-only gradient steps per batch after the main step. '
+                            'Reuses the chi2 matrix from the main step — cheap, no extra '
+                            'template interpolation. Use with --nz-lr for separate rate.')
+    train.add_argument('--nz-lr', type=float, default=None,
+                       help='Adam learning rate for the extra n(z)-only steps '
+                            '(defaults to --lr when not set).')
     train.add_argument('--t0-init', choices=['mean_flux', 'flat'], default='mean_flux',
                        help='Initialisation for template 0: mean_flux (default) or '
                             'flat (1.0 + noise, avoids edge artefacts)')
@@ -113,6 +130,11 @@ def parse_args() -> argparse.Namespace:
                             '(z_prior set to (zmin+zmax)/2, zerr=100). '
                             '0.0 = all use catalog prior; 1.0 = all disabled. '
                             'E.g. 0.99 disables 99%% of galaxies each step.')
+    prior.add_argument('--z-prior-warmup', type=int, default=0,
+                       metavar='EPOCHS',
+                       help='Linearly ramp blind fraction from 0 → --disable-z-prior '
+                            'over this many epochs. Prevents templates settling into '
+                            'wrong redshift convention before anchoring takes effect.')
 
     # ---- Checkpointing -------------------------------------------------------
     ckpt = p.add_argument_group("Checkpoints")
@@ -200,6 +222,7 @@ def main() -> None:
         zmax=args.zmax,
         Nz=args.Nz,
         Nnz=args.Nnz,
+        template_res_boost=args.template_res_boost,
     )
     print(f"  Template grid: {model.Nft} pts, "
           f"{float(model.t_wave[0]):.1f}–{float(model.t_wave[-1]):.1f} Å")
@@ -223,11 +246,24 @@ def main() -> None:
             flux_mean = _compute_flux_mean(ds)
         else:
             flux_mean = None
-        params = model.init_params(key, flux_mean=flux_mean, t0_init=args.t0_init)
+        params = model.init_params(key, flux_mean=flux_mean, t0_init=args.t0_init,
+                                   nz_sigma=args.nz_sigma)
 
     # ---- Optimiser -----------------------------------------------------------
-    optimizer = optax.adam(args.lr)
+    if args.freeze_templates:
+        optimizer = optax.masked(
+            optax.adam(args.lr), {"T": False, "log_nz_raw": True}
+        )
+    else:
+        optimizer = optax.adam(args.lr)
     opt_state = optimizer.init(params)
+
+    if args.nz_steps > 0:
+        nz_lr = args.nz_lr if args.nz_lr is not None else args.lr
+        nz_optimizer = optax.masked(
+            optax.adam(nz_lr), {"T": False, "log_nz_raw": True}
+        )
+        nz_opt_state = nz_optimizer.init(params)
 
     # ---- JIT-compiled training step ------------------------------------------
     # Closing over `model` and `optimizer` — they are Python objects whose JAX
@@ -243,9 +279,29 @@ def main() -> None:
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss_val
 
+    # ---- Extra n(z) step functions (only built when needed) ------------------
+    if args.nz_steps > 0:
+        @jax.jit
+        def compute_chi2(params, flux, ivar):
+            return model.compute_chi2_matrix(params, flux, ivar)
+
+        @jax.jit
+        def nz_step(params, nz_opt_state, chi2_matrix, z_prior, zerr):
+            loss_val, grads = jax.value_and_grad(model.nz_loss)(
+                params, chi2_matrix, z_prior, zerr
+            )
+            updates, new_state = nz_optimizer.update(grads, nz_opt_state)
+            new_params = optax.apply_updates(params, updates)
+            return new_params, new_state, loss_val
+
     # ---- Training loop -------------------------------------------------------
     print(f"\nTraining: {args.n_epochs - start_epoch} epochs, "
           f"{len(loader)} steps/epoch, batch={args.batch_size}")
+    if args.freeze_templates:
+        print("  freeze_templates=True  (T is held fixed)")
+    if args.nz_steps > 0:
+        nz_lr_eff = args.nz_lr if args.nz_lr is not None else args.lr
+        print(f"  nz_steps={args.nz_steps}  nz_lr={nz_lr_eff}")
     print("(First step triggers JAX JIT compilation — may be slow)\n")
 
     total_steps = 0
@@ -253,13 +309,21 @@ def main() -> None:
         epoch_losses: list[float] = []
         t0 = time.time()
 
+        # Curriculum: ramp blind fraction from 0 → target over warmup epochs
+        if args.disable_z_prior > 0.0 and args.z_prior_warmup > 0:
+            t = min(epoch / args.z_prior_warmup, 1.0)
+            blind_frac = args.disable_z_prior * t
+        else:
+            blind_frac = args.disable_z_prior
+        print(f"  blind_frac={blind_frac:.3f}")
+
         for batch in loader:
             flux = jnp.array(batch['flux'].numpy())
             ivar = jnp.array(batch['ivar'].numpy())
             z_prior = jnp.array(batch['z'].numpy())
             zerr = _get_zerr(batch, args)
-            if args.disable_z_prior > 0.0:
-                mask = np.random.random(args.batch_size) < args.disable_z_prior
+            if blind_frac > 0.0:
+                mask = np.random.random(args.batch_size) < blind_frac
                 z_center = (args.zmin + args.zmax) / 2.0
                 z_prior = jnp.where(mask, z_center, z_prior)
                 zerr = jnp.where(mask, 100.0, zerr)
@@ -268,6 +332,13 @@ def main() -> None:
                 params, opt_state, flux, ivar, z_prior, zerr
             )
             loss_scalar = float(loss_val)
+
+            if args.nz_steps > 0:
+                chi2_mat = compute_chi2(params, flux, ivar)
+                for _ in range(args.nz_steps):
+                    params, nz_opt_state, _ = nz_step(
+                        params, nz_opt_state, chi2_mat, z_prior, zerr
+                    )
             epoch_losses.append(loss_scalar)
 
             if total_steps % args.log_interval == 0:

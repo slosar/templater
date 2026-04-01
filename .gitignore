@@ -1,5 +1,6 @@
 # Data (symlinks to shared storage — not versioned)
 spectra
+spectra_shuffled/
 metadata/
 
 # Trained model checkpoints

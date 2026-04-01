@@ -66,6 +66,7 @@ class TemplateModel:
         zmax: float,
         Nz: int,
         Nnz: int = 50,
+        template_res_boost: float = 1.2,
     ) -> None:
         self.Nt = Nt
         self.Nf = int(len(wave_obs))
@@ -75,13 +76,15 @@ class TemplateModel:
         self.zmax = float(zmax)
         self.wave_min = float(wave_obs.min())
         self.wave_max = float(wave_obs.max())
+        self.template_res_boost = float(template_res_boost)
 
         # ---- Template rest-frame wavelength grid --------------------------------
         # Must cover wave_obs[f]/(1+z) for all z in [zmin, zmax].
         t_wave_min = self.wave_min / (1.0 + zmax)
         t_wave_max = self.wave_max / (1.0 + zmin)
-        # Spacing: match the approximate pixel scale of the observed grid.
-        delta_wave = (float(wave_obs[-1]) - float(wave_obs[0])) / (len(wave_obs) - 1)
+        # Spacing: match the approximate pixel scale of the observed grid,
+        # divided by template_res_boost to increase template resolution.
+        delta_wave = (float(wave_obs[-1]) - float(wave_obs[0])) / (len(wave_obs) - 1) / template_res_boost
         self.Nft = int(round((t_wave_max - t_wave_min) / delta_wave)) + 1
         t_wave = np.linspace(t_wave_min, t_wave_max, self.Nft).astype(np.float32)
 
@@ -127,6 +130,7 @@ class TemplateModel:
         key: jax.Array,
         flux_mean: Optional[np.ndarray] = None,
         t0_init: str = 'mean_flux',
+        nz_sigma: float = 0.05,
     ) -> dict:
         """Return initial parameter pytree {"T": (Nt, Nft), "log_nz_raw": (Nnz,)}.
 
@@ -136,7 +140,9 @@ class TemplateModel:
                         flux extrapolation when templates span a wider range than data
 
         Remaining templates always start as small Gaussian noise.
-        log_nz_raw is initialised to zeros (uniform n(z) after log_softmax).
+
+        log_nz_raw is initialised as a Gaussian centred at (zmin+zmax)/2 with
+        width nz_sigma * (zmax - zmin).  Set nz_sigma=0 for the old uniform init.
         """
         key_t0, key_noise = jax.random.split(key)
 
@@ -159,7 +165,15 @@ class TemplateModel:
             [jnp.array(t0)[None, :], noise],  # (Nt, Nft)
             axis=0,
         )
-        log_nz_raw = jnp.zeros(self.Nnz)
+        if nz_sigma > 0.0:
+            z_nz = np.array(self.z_nz_grid)
+            z_center = (self.zmin + self.zmax) / 2.0
+            sigma = nz_sigma * (self.zmax - self.zmin)
+            log_nz_raw = jnp.array(
+                -0.5 * ((z_nz - z_center) / sigma) ** 2, dtype=jnp.float32
+            )
+        else:
+            log_nz_raw = jnp.zeros(self.Nnz)
 
         return {"T": T, "log_nz_raw": log_nz_raw}
 
@@ -291,6 +305,75 @@ class TemplateModel:
         log_p = log_max + jnp.log(sum_exp)   # (B,)
         return -jnp.mean(log_p) + template_l2 * jnp.mean(params["T"] ** 2)
 
+    def compute_chi2_matrix(
+        self,
+        params: dict,
+        flux: jax.Array,
+        ivar: jax.Array,
+    ) -> jax.Array:
+        """Per-galaxy chi2_min at every z in the search grid.
+
+        Parameters
+        ----------
+        params : {"T": (Nt, Nft), ...}
+        flux   : (B, Nf)
+        ivar   : (B, Nf)
+
+        Returns
+        -------
+        chi2_matrix : (B, Nz)  — chi2_min[b, j] at zgrid[j], no n(z) or z-prior.
+        """
+        T_all = self._interpolate_templates(params["T"])   # (Nz, Nt, Nf)
+        flux_ivar_flux = (flux * ivar * flux).sum(axis=-1)
+        eye_Nt = jnp.eye(self.Nt)
+
+        def scan_body(_, T_z):
+            T_ivar = T_z[None, :, :] * ivar[:, None, :]
+            A = jnp.einsum('bkf,lf->bkl', T_ivar, T_z) + 1e-6 * eye_Nt[None]
+            b = (T_ivar * flux[:, None, :]).sum(axis=-1)
+            alpha = jax.vmap(jnp.linalg.solve)(A, b)
+            chi2 = flux_ivar_flux - (b * alpha).sum(axis=-1)   # (B,)
+            return _, chi2
+
+        _, chi2_matrix = jax.lax.scan(
+            jax.remat(scan_body), None, T_all
+        )   # (Nz, B)
+        return chi2_matrix.T   # (B, Nz)
+
+    def nz_loss(
+        self,
+        params: dict,
+        chi2_matrix: jax.Array,
+        z_prior: jax.Array,
+        zerr: jax.Array,
+    ) -> jax.Array:
+        """N(z)-only loss given a precomputed chi2 matrix.
+
+        Gradient flows only through params["log_nz_raw"]; chi2_matrix is treated
+        as a constant (it was computed from fixed or already-updated templates).
+
+        Parameters
+        ----------
+        params      : {"T": ..., "log_nz_raw": (Nnz,)}
+        chi2_matrix : (B, Nz)  from compute_chi2_matrix
+        z_prior     : (B,)
+        zerr        : (B,)
+
+        Returns
+        -------
+        Scalar loss.
+        """
+        log_nz_norm = jax.nn.log_softmax(params["log_nz_raw"])
+        log_nz_at_z = (
+            log_nz_norm[self.nz_lo_idx] * (1.0 - self.nz_weight)
+            + log_nz_norm[self.nz_lo_idx + 1] * self.nz_weight
+        )   # (Nz,)
+        zerr_safe = jnp.maximum(zerr, 1e-8)[:, None]
+        dz = self.zgrid[None, :] - z_prior[:, None]
+        log_prior = -0.5 * (dz / zerr_safe) ** 2   # (B, Nz)
+        log_w = log_nz_at_z[None, :] + log_prior - 0.5 * chi2_matrix   # (B, Nz)
+        return -jnp.mean(jax.nn.logsumexp(log_w, axis=-1))
+
     # -------------------------------------------------------------------------
     # Inference helpers
     # -------------------------------------------------------------------------
@@ -388,6 +471,7 @@ class TemplateModel:
             "wave_min": self.wave_min,
             "wave_max": self.wave_max,
             "Nf": self.Nf,
+            "template_res_boost": self.template_res_boost,
         }
 
     def save_checkpoint(self, params: dict, epoch: int, path: str) -> None:
@@ -414,6 +498,7 @@ class TemplateModel:
             zmax=cfg["zmax"],
             Nz=cfg["Nz"],
             Nnz=cfg["Nnz"],
+            template_res_boost=cfg.get("template_res_boost", 1.0),
         )
         params = {
             "T": jnp.array(ckpt["T"]),
