@@ -1,0 +1,19 @@
+# Data (symlinks to shared storage — not versioned)
+spectra
+metadata/
+
+# Trained model checkpoints
+checkpoints/
+
+# Plots / scratch outputs
+*.png
+*.jpg
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Claude Code internals
+.claude/
