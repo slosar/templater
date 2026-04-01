@@ -48,15 +48,12 @@ The wavelength grid is fixed at 3600–9824 Å (7781 pixels).
 
 ```bash
 # Phase 1 — template recovery (catalog redshifts as prior)
-python scripts/train.py \
-  --n-spectra 5000 --zmin 0.4 --zmax 1.1 \
-  --Nt 5 --Nz 200 --n-epochs 20
+
+ python scripts/train.py   --n-spectra 5000 --zmin 0.3 --zmax 0.8  --zmin-loader 0.4 --zmax-loader 0.7  --Nt 5 --Nz 1000 --n-epochs 200 --batch-size=2048
 
 # Phase 2 — blind redshift recovery (uninformative prior)
-python scripts/train.py \
-  --n-spectra 5000 --zmin 0.4 --zmax 1.1 \
-  --Nt 5 --Nz 200 --n-epochs 20 \
-  --zerr-override 1.0
+
+ python scripts/train.py   --n-spectra 5000 --zmin 0.3 --zmax 0.8  --zmin-loader 0.4 --zmax-loader 0.7  --Nt 5 --Nz 1000 --n-epochs 200 --batch-size=2048 --disable-z-prior
 
 # Quick smoke test
 python scripts/train.py \
