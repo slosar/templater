@@ -84,6 +84,11 @@ class SpectraDataset(Dataset):
         zmin: Optional[float] = None,
         zmax: Optional[float] = None,
         desi_target_mask: Optional[int] = None,
+        shape_nofz: bool = False,
+        nofz_z0: float = 0.92,
+        nofz_alpha: float = 40.0,
+        nofz_beta: float = 40.0,
+        seed: int = 0,
     ) -> None:
         files = _resolve_files(path)
         if not files:
@@ -96,7 +101,9 @@ class SpectraDataset(Dataset):
 
         # Read catalog from every file upfront (catalog rows are small).
         # index entries: (file_path, local_row_index, zerr_or_nan)
+        # z_index mirrors index and is used for rejection sampling then discarded.
         index: list[tuple[str, int, np.float32]] = []
+        z_index: list[float] = []
         for fpath in files:
             with fitsio.FITS(fpath) as f:
                 cat = f["cat"].read(columns=["targetid", "z", "desi_target"])
@@ -116,9 +123,21 @@ class SpectraDataset(Dataset):
                 tid = int(cat["targetid"][r])
                 zerr = zerr_map[tid] if zerr_map is not None else np.float32(np.nan)
                 index.append((fpath, int(r), zerr))
+                z_index.append(float(cat["z"][r]))
 
         if n_spectra is not None:
             index = index[:n_spectra]
+            z_index = z_index[:n_spectra]
+
+        # Rejection sampling to shape n(z)
+        if shape_nofz and index:
+            z_arr = np.array(z_index, dtype=np.float64)
+            accept_prob = _nofz_acceptance(z_arr, nofz_z0, nofz_alpha, nofz_beta)
+            rng = np.random.default_rng(seed)
+            keep_mask = rng.random(len(index)) < accept_prob
+            index = [item for item, k in zip(index, keep_mask) if k]
+            print(f"  shape_nofz: kept {len(index):,} / {len(keep_mask):,} spectra "
+                  f"({100 * keep_mask.mean():.1f}%)")
 
         self._index = index
         self._has_zerr = zerr_map is not None
@@ -170,6 +189,27 @@ def _load_zerr_map(catalog_path: str) -> dict[int, np.float32]:
     with fitsio.FITS(catalog_path) as f:
         cat = f[1].read(columns=["targetid", "zerr"])
     return {int(tid): np.float32(ze) for tid, ze in zip(cat["targetid"], cat["zerr"])}
+
+
+def _nofz_acceptance(z: np.ndarray, z0: float, alpha: float, beta: float) -> np.ndarray:
+    """Acceptance probability for rejection sampling to a target n(z) shape.
+
+    Target: n(z) = (z/z0)^alpha * exp(-(z/z0)^beta), normalised so max = 1.
+
+    The theoretical maximum occurs at z_peak = z0*(alpha/beta)^(1/beta):
+      n_max = (alpha/beta)^(alpha/beta) * exp(-alpha/beta)
+    Using the analytical max ensures acceptance is correctly in [0,1] even
+    when z0 is outside the redshift range of the input sample.
+
+    Returns an array of values in [0, 1] for each redshift in z.
+    """
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        nz = np.where(z > 0.0, (z / z0) ** alpha * np.exp(-((z / z0) ** beta)), 0.0)
+    # Analytical max in log-space to avoid overflow for large alpha/beta
+    ratio = alpha / beta
+    log_n_max = ratio * np.log(ratio) - ratio if ratio > 0 else 0.0
+    n_max = np.exp(log_n_max)
+    return np.clip(nz / n_max, 0.0, 1.0)
 
 
 def _resolve_files(path: str | Sequence[str]) -> list[str]:

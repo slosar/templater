@@ -68,6 +68,15 @@ def parse_args() -> argparse.Namespace:
                       help='Minimum redshift cut when loading spectra (defaults to --zmin)')
     data.add_argument('--zmax-loader', type=float, default=None,
                       help='Maximum redshift cut when loading spectra (defaults to --zmax)')
+    data.add_argument('--shape-nofz', action='store_true',
+                      help='Rejection-sample galaxies to shape the loaded n(z) to '
+                           '(z/z0)^alpha * exp(-(z/z0)^beta), normalised to peak=1.')
+    data.add_argument('--nofz-z0', type=float, default=0.92,
+                      help='z0 parameter for --shape-nofz target distribution')
+    data.add_argument('--nofz-alpha', type=float, default=40.0,
+                      help='alpha parameter for --shape-nofz target distribution')
+    data.add_argument('--nofz-beta', type=float, default=40.0,
+                      help='beta parameter for --shape-nofz target distribution')
 
     # ---- Model ---------------------------------------------------------------
     model_g = p.add_argument_group("Model")
@@ -194,6 +203,11 @@ def main() -> None:
         zmin=zmin_loader,
         zmax=zmax_loader,
         desi_target_mask=args.desi_target_mask,
+        shape_nofz=args.shape_nofz,
+        nofz_z0=args.nofz_z0,
+        nofz_alpha=args.nofz_alpha,
+        nofz_beta=args.nofz_beta,
+        seed=args.seed,
     )
     print(f"  {len(ds)} spectra | loader z in [{zmin_loader}, {zmax_loader}]")
 
