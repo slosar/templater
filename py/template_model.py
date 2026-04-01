@@ -126,26 +126,31 @@ class TemplateModel:
         self,
         key: jax.Array,
         flux_mean: Optional[np.ndarray] = None,
+        t0_init: str = 'mean_flux',
     ) -> dict:
         """Return initial parameter pytree {"T": (Nt, Nft), "log_nz_raw": (Nnz,)}.
 
-        T[0] is initialised to a scaled version of the mean observed flux
-        interpolated onto the template grid.  Remaining templates start as
-        small Gaussian noise so they can differentiate during training.
+        T[0] initialisation is controlled by t0_init:
+          'mean_flux' — interpolate mean observed flux onto template grid (default)
+          'flat'      — 1.0 + small random noise; avoids edge artefacts from
+                        flux extrapolation when templates span a wider range than data
 
+        Remaining templates always start as small Gaussian noise.
         log_nz_raw is initialised to zeros (uniform n(z) after log_softmax).
         """
-        key_noise, _ = jax.random.split(key)
+        key_t0, key_noise = jax.random.split(key)
 
-        t_wave_np = np.array(self.t_wave)
-        wave_obs_np = np.array(self.wave_obs)
-
-        if flux_mean is not None:
-            # Interpolate mean flux from wave_obs to t_wave
-            t0 = np.interp(t_wave_np, wave_obs_np, flux_mean).astype(np.float32)
-            t0 = np.maximum(t0, 0.0) / self.Nt
-        else:
-            t0 = np.ones(self.Nft, dtype=np.float32) * 0.1
+        if t0_init == 'flat':
+            t0 = np.ones(self.Nft, dtype=np.float32)
+            t0 += np.array(jax.random.normal(key_t0, shape=(self.Nft,))) * 0.01
+        else:  # 'mean_flux'
+            t_wave_np = np.array(self.t_wave)
+            wave_obs_np = np.array(self.wave_obs)
+            if flux_mean is not None:
+                t0 = np.interp(t_wave_np, wave_obs_np, flux_mean).astype(np.float32)
+                t0 = np.maximum(t0, 0.0) / self.Nt
+            else:
+                t0 = np.ones(self.Nft, dtype=np.float32) * 0.1
 
         noise_scale = float(np.abs(t0).mean()) * 0.01
         noise = jax.random.normal(key_noise, shape=(self.Nt - 1, self.Nft)) * noise_scale

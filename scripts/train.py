@@ -88,6 +88,9 @@ def parse_args() -> argparse.Namespace:
     # ---- Training ------------------------------------------------------------
     train = p.add_argument_group("Training")
     train.add_argument('--n-epochs', type=int, default=20, help='Number of training epochs')
+    train.add_argument('--t0-init', choices=['mean_flux', 'flat'], default='mean_flux',
+                       help='Initialisation for template 0: mean_flux (default) or '
+                            'flat (1.0 + noise, avoids edge artefacts)')
     train.add_argument('--template-l2', type=float, default=0.0,
                        help='L2 regularisation on templates. Pushes unconstrained '
                             'edge regions to zero. Try 1e-4 to 1e-2.')
@@ -212,9 +215,12 @@ def main() -> None:
         start_epoch += 1
         print(f"  Continuing from epoch {start_epoch}")
     else:
-        print("Computing flux mean for template initialisation...")
-        flux_mean = _compute_flux_mean(ds)
-        params = model.init_params(key, flux_mean=flux_mean)
+        if args.t0_init == 'mean_flux':
+            print("Computing flux mean for template initialisation...")
+            flux_mean = _compute_flux_mean(ds)
+        else:
+            flux_mean = None
+        params = model.init_params(key, flux_mean=flux_mean, t0_init=args.t0_init)
 
     # ---- Optimiser -----------------------------------------------------------
     optimizer = optax.adam(args.lr)
