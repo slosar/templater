@@ -85,7 +85,7 @@ class SpectraDataset(Dataset):
         zmax: Optional[float] = None,
         desi_target_mask: Optional[int] = None,
         shape_nofz: bool = False,
-        nofz_z0: float = 0.92,
+        nofz_z0: float = 0.88,
         nofz_alpha: float = 40.0,
         nofz_beta: float = 40.0,
         seed: int = 0,
@@ -125,11 +125,8 @@ class SpectraDataset(Dataset):
                 index.append((fpath, int(r), zerr))
                 z_index.append(float(cat["z"][r]))
 
-        if n_spectra is not None:
-            index = index[:n_spectra]
-            z_index = z_index[:n_spectra]
-
-        # Rejection sampling to shape n(z)
+        # Rejection sampling to shape n(z) — applied before n_spectra cap so
+        # that the cap is met after rejection (not before).
         if shape_nofz and index:
             z_arr = np.array(z_index, dtype=np.float64)
             accept_prob = _nofz_acceptance(z_arr, nofz_z0, nofz_alpha, nofz_beta)
@@ -138,6 +135,9 @@ class SpectraDataset(Dataset):
             index = [item for item, k in zip(index, keep_mask) if k]
             print(f"  shape_nofz: kept {len(index):,} / {len(keep_mask):,} spectra "
                   f"({100 * keep_mask.mean():.1f}%)")
+
+        if n_spectra is not None:
+            index = index[:n_spectra]
 
         self._index = index
         self._has_zerr = zerr_map is not None

@@ -53,7 +53,7 @@ The wavelength grid is fixed at 3600–9824 Å (7781 pixels).
 
 # Phase 2 — blind redshift recovery (uninformative prior)
 
- python scripts/train.py   --n-spectra 5000 --zmin 0.3 --zmax 0.8  --zmin-loader 0.4 --zmax-loader 0.7  --Nt 5 --Nz 1000 --n-epochs 200 --batch-size=2048 --disable-z-prior
+ python scripts/train.py   --n-spectra 5000 --zmin 0.3 --zmax 0.8  --zmin-loader 0.4 --zmax-loader 0.7  --Nt 5 --Nz 1000 --n-epochs 200 --batch-size=2048 --disable-z-prior 0.99
 
 # Quick smoke test
 python scripts/train.py \

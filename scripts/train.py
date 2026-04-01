@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     data.add_argument('--shape-nofz', action='store_true',
                       help='Rejection-sample galaxies to shape the loaded n(z) to '
                            '(z/z0)^alpha * exp(-(z/z0)^beta), normalised to peak=1.')
-    data.add_argument('--nofz-z0', type=float, default=0.92,
+    data.add_argument('--nofz-z0', type=float, default=0.88,
                       help='z0 parameter for --shape-nofz target distribution')
     data.add_argument('--nofz-alpha', type=float, default=40.0,
                       help='alpha parameter for --shape-nofz target distribution')
@@ -153,6 +153,12 @@ def parse_args() -> argparse.Namespace:
                       help='Save every N epochs')
     ckpt.add_argument('--resume', default=None,
                       help='Path to .npz checkpoint to resume from')
+    ckpt.add_argument('--resume-templates-only', default=None,
+                      metavar='CHECKPOINT',
+                      help='Load only the T array from this checkpoint; '
+                           'reinitialise log_nz_raw fresh (using --nz-sigma). '
+                           'Starts from epoch 0. Useful with --freeze-templates '
+                           'to optimise n(z) on a new dataset with fixed templates.')
 
     # ---- Logging -------------------------------------------------------------
     log = p.add_argument_group("Logging")
@@ -254,6 +260,14 @@ def main() -> None:
         _, params, start_epoch = TemplateModel.load_checkpoint(args.resume, wave_obs)
         start_epoch += 1
         print(f"  Continuing from epoch {start_epoch}")
+    elif args.resume_templates_only is not None:
+        print(f"Loading templates from {args.resume_templates_only} (n(z) reinitialised)")
+        _, ckpt_params, ckpt_epoch = TemplateModel.load_checkpoint(
+            args.resume_templates_only, wave_obs
+        )
+        fresh = model.init_params(key, nz_sigma=args.nz_sigma)
+        params = {"T": ckpt_params["T"], "log_nz_raw": fresh["log_nz_raw"]}
+        print(f"  Templates from epoch {ckpt_epoch}, n(z) fresh (nz_sigma={args.nz_sigma})")
     else:
         if args.t0_init == 'mean_flux':
             print("Computing flux mean for template initialisation...")
@@ -264,12 +278,10 @@ def main() -> None:
                                    nz_sigma=args.nz_sigma)
 
     # ---- Optimiser -----------------------------------------------------------
-    if args.freeze_templates:
-        optimizer = optax.masked(
-            optax.adam(args.lr), {"T": False, "log_nz_raw": True}
-        )
-    else:
-        optimizer = optax.adam(args.lr)
+    # Always use plain adam.  When --freeze-templates, we stop gradients from
+    # flowing through T inside train_step (see below), so T's gradient is
+    # exactly zero and its adam state never moves — no masked optimizer needed.
+    optimizer = optax.adam(args.lr)
     opt_state = optimizer.init(params)
 
     if args.nz_steps > 0:
@@ -280,18 +292,32 @@ def main() -> None:
         nz_opt_state = nz_optimizer.init(params)
 
     # ---- JIT-compiled training step ------------------------------------------
-    # Closing over `model` and `optimizer` — they are Python objects whose JAX
-    # array attributes become compile-time constants in the XLA graph.
     template_l2 = args.template_l2
 
-    @jax.jit
-    def train_step(params, opt_state, flux, ivar, z_prior, zerr):
-        loss_val, grads = jax.value_and_grad(model.loss)(
-            params, flux, ivar, z_prior, zerr, template_l2
-        )
-        updates, new_opt_state = optimizer.update(grads, opt_state)
-        new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss_val
+    if args.freeze_templates:
+        @jax.jit
+        def train_step(params, opt_state, flux, ivar, z_prior, zerr):
+            # stop_gradient on T: gradient is exactly zero, backward pass
+            # does not traverse template interpolation at all.
+            frozen_params = {
+                "T": jax.lax.stop_gradient(params["T"]),
+                "log_nz_raw": params["log_nz_raw"],
+            }
+            loss_val, grads = jax.value_and_grad(model.loss)(
+                frozen_params, flux, ivar, z_prior, zerr, template_l2
+            )
+            updates, new_opt_state = optimizer.update(grads, opt_state)
+            new_params = optax.apply_updates(params, updates)
+            return new_params, new_opt_state, loss_val
+    else:
+        @jax.jit
+        def train_step(params, opt_state, flux, ivar, z_prior, zerr):
+            loss_val, grads = jax.value_and_grad(model.loss)(
+                params, flux, ivar, z_prior, zerr, template_l2
+            )
+            updates, new_opt_state = optimizer.update(grads, opt_state)
+            new_params = optax.apply_updates(params, updates)
+            return new_params, new_opt_state, loss_val
 
     # ---- Extra n(z) step functions (only built when needed) ------------------
     if args.nz_steps > 0:
