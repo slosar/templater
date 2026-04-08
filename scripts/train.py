@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
                       help='alpha parameter for --shape-nofz target distribution')
     data.add_argument('--nofz-beta', type=float, default=40.0,
                       help='beta parameter for --shape-nofz target distribution')
+    data.add_argument('--target-noise', type=float, default=0.0,
+                      help='Add noise per batch to bring each spectrum down to this '
+                           'total SNR = sqrt(sum(flux^2*ivar)).  Spectra already '
+                           'below this SNR are left unchanged.  0 = disabled.')
 
     # ---- Model ---------------------------------------------------------------
     model_g = p.add_argument_group("Model")
@@ -96,6 +100,24 @@ def parse_args() -> argparse.Namespace:
     model_g.add_argument('--template-res-boost', type=float, default=1.0,
                          help='Divide the template pixel spacing by this factor, '
                               'increasing template resolution. 1.0 = native pixel scale.')
+    # Neural template options
+    model_g.add_argument('--neural-templates', action='store_true',
+                         help='Use NeuralTemplateModel: MLP continuum + explicit spectral '
+                              'lines + GMM prior on template amplitudes.')
+    model_g.add_argument('--mlp-hidden', type=int, default=64,
+                         help='Hidden layer width of the continuum MLP '
+                              '(only used with --neural-templates).')
+    model_g.add_argument('--gmm-components', type=int, default=5,
+                         help='Number of GMM components for the alpha prior '
+                              '(only used with --neural-templates).')
+    model_g.add_argument('--gmm-weight', type=float, default=0.1,
+                         help='Weight on log p_GMM(alpha) added to per-galaxy log-weight. '
+                              'Set 0.0 to disable. (only used with --neural-templates).')
+    model_g.add_argument('--line-noise-init', type=float, default=0.01,
+                         help='Std of the random noise for non-[OII] line amplitudes at init. '
+                              'The [OII] doublet is always initialised to 1.0. '
+                              '(only used with --neural-templates).')
+
     model_g.add_argument('--nz-sigma', type=float, default=0.4,
                          help='Width of initial n(z) Gaussian as a fraction of the z range. '
                               'E.g. 0.05 with z=[0.4,1.1] gives sigma=0.035 in redshift. '
@@ -120,6 +142,10 @@ def parse_args() -> argparse.Namespace:
     train.add_argument('--template-l2', type=float, default=0.0,
                        help='L2 regularisation on templates. Pushes unconstrained '
                             'edge regions to zero. Try 1e-4 to 1e-2.')
+    train.add_argument('--template-ortho', type=float, default=0.0,
+                       help='Orthogonality regularisation weight. Penalises pairwise '
+                            'correlations between templates to prevent degeneracy. '
+                            'Try 0.1 to 1.0.')
     train.add_argument('--lr', type=float, default=1e-3, help='Adam learning rate')
     train.add_argument('--batch-size', type=int, default=256, help='Batch size (fixed via drop_last)')
     train.add_argument('--seed', type=int, default=42, help='Random seed')
@@ -176,6 +202,27 @@ def _compute_flux_mean(ds: SpectraDataset, n_sample: int = 500) -> np.ndarray:
     return np.mean(fluxes, axis=0)
 
 
+def _compute_snr_stats(ds: SpectraDataset, label: str = "SNR stats",
+                       n_sample: int = 2000) -> None:
+    """Sample spectra and print SNR statistics. Respects ds._target_noise."""
+    rng = np.random.default_rng(0)
+    indices = rng.choice(len(ds), size=min(n_sample, len(ds)), replace=False)
+    snrs = []
+    for i in indices:
+        item = ds[int(i)]
+        flux = item['flux'].numpy()
+        ivar = item['ivar'].numpy()
+        w = np.where(ivar>0)[0]
+        Np = len(w)
+        snr2 = (flux**2 * ivar)[w].sum() - Np
+        snr = np.sqrt(snr2) if snr2 > 0 else 0.0
+        snrs.append(float(snr))
+    snrs = np.array(snrs)
+    print(f"  {label} ({len(snrs)} spectra): "
+          f"min={snrs.min():.1f}  median={np.median(snrs):.1f}  "
+          f"mean={snrs.mean():.1f}  max={snrs.max():.1f}")
+
+
 def _get_zerr(batch: dict, args: argparse.Namespace) -> jax.Array:
     """Return zerr JAX array for the current batch, applying override/floor."""
     B = batch['flux'].shape[0]
@@ -214,8 +261,17 @@ def main() -> None:
         nofz_alpha=args.nofz_alpha,
         nofz_beta=args.nofz_beta,
         seed=args.seed,
+        target_noise=args.target_noise,
     )
     print(f"  {len(ds)} spectra | loader z in [{zmin_loader}, {zmax_loader}]")
+    if args.target_noise > 0:
+        ds._target_noise = 0.0
+        _compute_snr_stats(ds, label="SNR stats (raw)")
+        ds._target_noise = args.target_noise
+        print(f"  target_noise={args.target_noise:.1f}")
+        _compute_snr_stats(ds, label="SNR stats (noisy)")
+    else:
+        _compute_snr_stats(ds)
 
     if len(ds) < args.batch_size:
         raise ValueError(
@@ -235,21 +291,43 @@ def main() -> None:
     wave_obs = ds.wave.numpy()
 
     # ---- Build model ---------------------------------------------------------
-    model = TemplateModel(
-        Nt=args.Nt,
-        wave_obs=wave_obs,
-        zmin=args.zmin,
-        zmax=args.zmax,
-        Nz=args.Nz,
-        Nnz=args.Nnz,
-        template_res_boost=args.template_res_boost,
-    )
+    if args.neural_templates:
+        from neural_template_model import NeuralTemplateModel
+        model = NeuralTemplateModel(
+            Nt=args.Nt,
+            wave_obs=wave_obs,
+            zmin=args.zmin,
+            zmax=args.zmax,
+            Nz=args.Nz,
+            Nnz=args.Nnz,
+            template_res_boost=args.template_res_boost,
+            mlp_hidden=args.mlp_hidden,
+            gmm_components=args.gmm_components,
+            gmm_weight=args.gmm_weight,
+        )
+        print(f"  NeuralTemplateModel: MLP hidden={args.mlp_hidden}, "
+              f"GMM K={args.gmm_components}, gmm_weight={args.gmm_weight}")
+        print(f"  Active lines ({model.N_lines}): {', '.join(model.active_line_names)}")
+    else:
+        model = TemplateModel(
+            Nt=args.Nt,
+            wave_obs=wave_obs,
+            zmin=args.zmin,
+            zmax=args.zmax,
+            Nz=args.Nz,
+            Nnz=args.Nnz,
+            template_res_boost=args.template_res_boost,
+            gmm_components=args.gmm_components,
+            gmm_weight=args.gmm_weight,
+        )
     print(f"  Template grid: {model.Nft} pts, "
           f"{float(model.t_wave[0]):.1f}–{float(model.t_wave[-1]):.1f} Å")
     print(f"  Search grid:   Nz={args.Nz}, z in [{args.zmin}, {args.zmax}]")
     if zmin_loader != args.zmin or zmax_loader != args.zmax:
         print(f"  (loader cut:   z in [{zmin_loader}, {zmax_loader}])")
     print(f"  n(z) bins:     Nnz={args.Nnz}")
+    if model.gmm_components > 0:
+        print(f"  GMM alpha prior: K={model.gmm_components}, weight={model.gmm_weight}")
 
     # ---- Initialise or resume ------------------------------------------------
     key = jax.random.PRNGKey(args.seed)
@@ -257,25 +335,57 @@ def main() -> None:
 
     if args.resume is not None:
         print(f"Resuming from {args.resume}")
-        _, params, start_epoch = TemplateModel.load_checkpoint(args.resume, wave_obs)
+        if args.neural_templates:
+            _, params, start_epoch = NeuralTemplateModel.load_checkpoint(args.resume, wave_obs)
+        else:
+            _, params, start_epoch = TemplateModel.load_checkpoint(args.resume, wave_obs)
+            if model.gmm_components > 0 and 'gmm_log_pi' not in params:
+                print("  Checkpoint predates GMM — initialising GMM params fresh.")
+                fresh = model.init_params(key, nz_sigma=args.nz_sigma)
+                params['gmm_log_pi'] = fresh['gmm_log_pi']
+                params['gmm_mu']     = fresh['gmm_mu']
+                params['gmm_L_raw']  = fresh['gmm_L_raw']
         start_epoch += 1
         print(f"  Continuing from epoch {start_epoch}")
     elif args.resume_templates_only is not None:
         print(f"Loading templates from {args.resume_templates_only} (n(z) reinitialised)")
-        _, ckpt_params, ckpt_epoch = TemplateModel.load_checkpoint(
-            args.resume_templates_only, wave_obs
-        )
-        fresh = model.init_params(key, nz_sigma=args.nz_sigma)
-        params = {"T": ckpt_params["T"], "log_nz_raw": fresh["log_nz_raw"]}
+        if args.neural_templates:
+            _, ckpt_params, ckpt_epoch = NeuralTemplateModel.load_checkpoint(
+                args.resume_templates_only, wave_obs
+            )
+            fresh = model.init_params(key, nz_sigma=args.nz_sigma)
+            params = {
+                'mlp_weights':    ckpt_params['mlp_weights'],
+                'line_A':         ckpt_params['line_A'],
+                'line_sigma_raw': ckpt_params['line_sigma_raw'],
+                'log_nz_raw':     fresh['log_nz_raw'],
+                'gmm_log_pi':     fresh['gmm_log_pi'],
+                'gmm_mu':         fresh['gmm_mu'],
+                'gmm_L_raw':      fresh['gmm_L_raw'],
+            }
+        else:
+            _, ckpt_params, ckpt_epoch = TemplateModel.load_checkpoint(
+                args.resume_templates_only, wave_obs
+            )
+            fresh = model.init_params(key, nz_sigma=args.nz_sigma)
+            params = {"T": ckpt_params["T"], "log_nz_raw": fresh["log_nz_raw"]}
+            if model.gmm_components > 0:
+                params['gmm_log_pi'] = fresh['gmm_log_pi']
+                params['gmm_mu']     = fresh['gmm_mu']
+                params['gmm_L_raw']  = fresh['gmm_L_raw']
         print(f"  Templates from epoch {ckpt_epoch}, n(z) fresh (nz_sigma={args.nz_sigma})")
     else:
-        if args.t0_init == 'mean_flux':
-            print("Computing flux mean for template initialisation...")
-            flux_mean = _compute_flux_mean(ds)
+        if args.neural_templates:
+            params = model.init_params(key, nz_sigma=args.nz_sigma,
+                                       line_amp_init=args.line_noise_init)
         else:
-            flux_mean = None
-        params = model.init_params(key, flux_mean=flux_mean, t0_init=args.t0_init,
-                                   nz_sigma=args.nz_sigma)
+            if args.t0_init == 'mean_flux':
+                print("Computing flux mean for template initialisation...")
+                flux_mean = _compute_flux_mean(ds)
+            else:
+                flux_mean = None
+            params = model.init_params(key, flux_mean=flux_mean, t0_init=args.t0_init,
+                                       nz_sigma=args.nz_sigma)
 
     # ---- Optimiser -----------------------------------------------------------
     # Always use plain adam.  When --freeze-templates, we stop gradients from
@@ -286,34 +396,56 @@ def main() -> None:
 
     if args.nz_steps > 0:
         nz_lr = args.nz_lr if args.nz_lr is not None else args.lr
-        nz_optimizer = optax.masked(
-            optax.adam(nz_lr), {"T": False, "log_nz_raw": True}
-        )
+        if args.neural_templates:
+            # Build mask matching the neural params pytree structure;
+            # only log_nz_raw gets gradient updates in nz_loss.
+            nz_mask = {
+                k: (True if k == 'log_nz_raw'
+                    else jax.tree_util.tree_map(lambda _: False, v))
+                for k, v in params.items()
+            }
+        else:
+            nz_mask = {"T": False, "log_nz_raw": True}
+        nz_optimizer = optax.masked(optax.adam(nz_lr), nz_mask)
         nz_opt_state = nz_optimizer.init(params)
 
     # ---- JIT-compiled training step ------------------------------------------
     template_l2 = args.template_l2
+    template_ortho = args.template_ortho
 
     if args.freeze_templates:
-        @jax.jit
-        def train_step(params, opt_state, flux, ivar, z_prior, zerr):
-            # stop_gradient on T: gradient is exactly zero, backward pass
-            # does not traverse template interpolation at all.
-            frozen_params = {
-                "T": jax.lax.stop_gradient(params["T"]),
-                "log_nz_raw": params["log_nz_raw"],
-            }
-            loss_val, grads = jax.value_and_grad(model.loss)(
-                frozen_params, flux, ivar, z_prior, zerr, template_l2
-            )
-            updates, new_opt_state = optimizer.update(grads, opt_state)
-            new_params = optax.apply_updates(params, updates)
-            return new_params, new_opt_state, loss_val
+        if args.neural_templates:
+            _template_keys = {'mlp_weights', 'line_A', 'line_sigma_raw'}
+            @jax.jit
+            def train_step(params, opt_state, flux, ivar, z_prior, zerr):
+                frozen_params = {
+                    k: jax.lax.stop_gradient(v) if k in _template_keys else v
+                    for k, v in params.items()
+                }
+                loss_val, grads = jax.value_and_grad(model.loss)(
+                    frozen_params, flux, ivar, z_prior, zerr, template_l2, template_ortho
+                )
+                updates, new_opt_state = optimizer.update(grads, opt_state)
+                new_params = optax.apply_updates(params, updates)
+                return new_params, new_opt_state, loss_val
+        else:
+            @jax.jit
+            def train_step(params, opt_state, flux, ivar, z_prior, zerr):
+                frozen_params = {
+                    "T": jax.lax.stop_gradient(params["T"]),
+                    "log_nz_raw": params["log_nz_raw"],
+                }
+                loss_val, grads = jax.value_and_grad(model.loss)(
+                    frozen_params, flux, ivar, z_prior, zerr, template_l2, template_ortho
+                )
+                updates, new_opt_state = optimizer.update(grads, opt_state)
+                new_params = optax.apply_updates(params, updates)
+                return new_params, new_opt_state, loss_val
     else:
         @jax.jit
         def train_step(params, opt_state, flux, ivar, z_prior, zerr):
             loss_val, grads = jax.value_and_grad(model.loss)(
-                params, flux, ivar, z_prior, zerr, template_l2
+                params, flux, ivar, z_prior, zerr, template_l2, template_ortho
             )
             updates, new_opt_state = optimizer.update(grads, opt_state)
             new_params = optax.apply_updates(params, updates)

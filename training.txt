@@ -1,0 +1,1 @@
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 python scripts/train.py --Nt=4 --n-spectra 50000 --zmin 0.75 --zmax 1.0 --zmin-loader 0.75 --zmax-loader 1.0 --Nz 1000 --n-epochs 200 --batch-size=8192 --disable-z-prior 0.00 --z-prior-warmup 30 --nz-steps 0 --nz-sigma=0.6 --neural-templates

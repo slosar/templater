@@ -41,6 +41,42 @@ import jax.numpy as jnp
 import numpy as np
 
 
+# ---------------------------------------------------------------------------
+# GMM helpers (shared logic with NeuralTemplateModel)
+# ---------------------------------------------------------------------------
+
+def _make_L(L_raw: jax.Array) -> jax.Array:
+    """Unconstrained (K, Nt, Nt) → lower-triangular with positive diagonal."""
+    Nt = L_raw.shape[-1]
+    eye = jnp.eye(Nt)
+    L = jnp.tril(L_raw)
+    diag_raw = (L_raw * eye[None]).sum(axis=-1)          # (K, Nt)
+    diag_pos = jax.nn.softplus(diag_raw) + 1e-3
+    diag_mat = jnp.einsum('ki,ij->kij', diag_pos, eye)  # (K, Nt, Nt)
+    return L * (1.0 - eye)[None] + diag_mat
+
+
+def _gmm_log_prob(
+    alpha: jax.Array,
+    log_pi: jax.Array,
+    mu: jax.Array,
+    L_raw: jax.Array,
+) -> jax.Array:
+    """Log probability of alpha under a GMM with Cholesky-parameterised covariances."""
+    K, Nt = mu.shape
+    log_pi_norm = jax.nn.log_softmax(log_pi)
+    L = _make_L(L_raw)
+
+    def component_lp(log_pi_k, mu_k, L_k):
+        diff = alpha - mu_k
+        z = jax.scipy.linalg.solve_triangular(L_k, diff, lower=True)
+        log_det_L = jnp.sum(jnp.log(jnp.diag(L_k)))
+        return log_pi_k - 0.5 * (Nt * jnp.log(2.0 * jnp.pi) + 2.0 * log_det_L + jnp.sum(z ** 2))
+
+    log_components = jax.vmap(component_lp)(log_pi_norm, mu, L)
+    return jax.nn.logsumexp(log_components)
+
+
 class TemplateModel:
     """JAX spectral template model.
 
@@ -67,6 +103,8 @@ class TemplateModel:
         Nz: int,
         Nnz: int = 50,
         template_res_boost: float = 1.2,
+        gmm_components: int = 0,
+        gmm_weight: float = 0.1,
     ) -> None:
         self.Nt = Nt
         self.Nf = int(len(wave_obs))
@@ -77,6 +115,8 @@ class TemplateModel:
         self.wave_min = float(wave_obs.min())
         self.wave_max = float(wave_obs.max())
         self.template_res_boost = float(template_res_boost)
+        self.gmm_components = int(gmm_components)
+        self.gmm_weight = float(gmm_weight)
 
         # ---- Template rest-frame wavelength grid --------------------------------
         # Must cover wave_obs[f]/(1+z) for all z in [zmin, zmax].
@@ -175,7 +215,17 @@ class TemplateModel:
         else:
             log_nz_raw = jnp.zeros(self.Nnz)
 
-        return {"T": T, "log_nz_raw": log_nz_raw}
+        params = {"T": T, "log_nz_raw": log_nz_raw}
+
+        if self.gmm_components > 0:
+            key, k_gmm = jax.random.split(key_noise)
+            K, Nt = self.gmm_components, self.Nt
+            diag_init = float(np.log(np.exp(10.0) - 1.0))  # softplus^{-1}(10.0) → σ≈10
+            params['gmm_log_pi'] = jnp.zeros(K)
+            params['gmm_mu']     = jax.random.normal(k_gmm, (K, Nt)) * 30.0
+            params['gmm_L_raw']  = jnp.zeros((K, Nt, Nt)) + diag_init * jnp.eye(Nt)[None]
+
+        return params
 
     # -------------------------------------------------------------------------
     # Interpolation
@@ -230,18 +280,22 @@ class TemplateModel:
         z_prior: jax.Array,
         zerr: jax.Array,
         template_l2: float = 0.0,
+        template_ortho: float = 0.0,
     ) -> jax.Array:
         """Negative mean log-likelihood over a batch.
 
         Parameters
         ----------
-        params      : {"T": (Nt, Nft), "log_nz_raw": (Nnz,)}
-        flux        : (B, Nf)  float32
-        ivar        : (B, Nf)  float32
-        z_prior     : (B,)     float32 — catalog redshift
-        zerr        : (B,)     float32 — catalog redshift uncertainty
-        template_l2 : float    L2 regularisation weight on T. Pushes template
-                               values in unconstrained (edge) regions to zero.
+        params         : {"T": (Nt, Nft), "log_nz_raw": (Nnz,)}
+        flux           : (B, Nf)  float32
+        ivar           : (B, Nf)  float32
+        z_prior        : (B,)     float32 — catalog redshift
+        zerr           : (B,)     float32 — catalog redshift uncertainty
+        template_l2    : float    L2 regularisation weight on T. Pushes template
+                                  values in unconstrained (edge) regions to zero.
+        template_ortho : float    Orthogonality regularisation weight. Penalises
+                                  pairwise correlations between templates, preventing
+                                  template degeneracy. Try 0.1 to 1.0.
 
         Returns
         -------
@@ -266,6 +320,7 @@ class TemplateModel:
 
         Nt = self.Nt
         eye_Nt = jnp.eye(Nt)
+        gmm_weight = self.gmm_weight
 
         def scan_body(carry, x):
             log_max, sum_exp = carry          # each (B,)
@@ -288,6 +343,15 @@ class TemplateModel:
             # Log weight at this z for each galaxy
             log_w = log_nz_z + log_prior_z - 0.5 * chi2       # (B,)
 
+            # GMM prior on alpha (compiled away when gmm_components == 0)
+            if self.gmm_components > 0 and gmm_weight > 0.0:
+                log_p_alpha = jax.vmap(
+                    lambda a: _gmm_log_prob(
+                        a, params['gmm_log_pi'], params['gmm_mu'], params['gmm_L_raw']
+                    )
+                )(alpha)                                         # (B,)
+                log_w = log_w + gmm_weight * log_p_alpha
+
             # Numerically stable online logsumexp update
             new_max = jnp.maximum(log_max, log_w)
             new_sum = sum_exp * jnp.exp(log_max - new_max) + jnp.exp(log_w - new_max)
@@ -303,7 +367,21 @@ class TemplateModel:
         )
 
         log_p = log_max + jnp.log(sum_exp)   # (B,)
-        return -jnp.mean(log_p) + template_l2 * jnp.mean(params["T"] ** 2)
+        loss_val = -jnp.mean(log_p)
+
+        if template_l2 > 0.0:
+            loss_val = loss_val + template_l2 * jnp.mean(params["T"] ** 2)
+
+        if template_ortho > 0.0:
+            T = params["T"]   # (Nt, Nft)
+            gram = T @ T.T    # (Nt, Nt)
+            diag = jnp.diag(gram) + 1e-8
+            norm = jnp.sqrt(diag[:, None] * diag[None, :])
+            corr = gram / norm   # correlation matrix, entries in [-1, 1]
+            off_diag = corr * (1.0 - jnp.eye(self.Nt))
+            loss_val = loss_val + template_ortho * jnp.mean(off_diag ** 2)
+
+        return loss_val
 
     def compute_chi2_matrix(
         self,
@@ -472,16 +550,22 @@ class TemplateModel:
             "wave_max": self.wave_max,
             "Nf": self.Nf,
             "template_res_boost": self.template_res_boost,
+            "gmm_components": self.gmm_components,
+            "gmm_weight": self.gmm_weight,
         }
 
     def save_checkpoint(self, params: dict, epoch: int, path: str) -> None:
         """Save params and config to a .npz file."""
-        np.savez(
-            path,
-            T=np.array(params["T"]),
-            log_nz_raw=np.array(params["log_nz_raw"]),
-            config=json.dumps(self.config() | {"epoch": epoch}),
-        )
+        arrays = {
+            "T": np.array(params["T"]),
+            "log_nz_raw": np.array(params["log_nz_raw"]),
+            "config": json.dumps(self.config() | {"epoch": epoch}),
+        }
+        if self.gmm_components > 0:
+            arrays["gmm_log_pi"] = np.array(params["gmm_log_pi"])
+            arrays["gmm_mu"]     = np.array(params["gmm_mu"])
+            arrays["gmm_L_raw"]  = np.array(params["gmm_L_raw"])
+        np.savez(path, **arrays)
 
     @staticmethod
     def load_checkpoint(
@@ -499,9 +583,15 @@ class TemplateModel:
             Nz=cfg["Nz"],
             Nnz=cfg["Nnz"],
             template_res_boost=cfg.get("template_res_boost", 1.0),
+            gmm_components=cfg.get("gmm_components", 0),
+            gmm_weight=cfg.get("gmm_weight", 0.1),
         )
         params = {
             "T": jnp.array(ckpt["T"]),
             "log_nz_raw": jnp.array(ckpt["log_nz_raw"]),
         }
+        if model.gmm_components > 0:
+            params["gmm_log_pi"] = jnp.array(ckpt["gmm_log_pi"])
+            params["gmm_mu"]     = jnp.array(ckpt["gmm_mu"])
+            params["gmm_L_raw"]  = jnp.array(ckpt["gmm_L_raw"])
         return model, params, int(cfg["epoch"])
