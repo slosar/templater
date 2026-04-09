@@ -12,7 +12,7 @@ describe a galaxy survey, by marginalising over redshift.
 py/
   spectra_loader.py        — PyTorch Dataset for FITS spectra (fitsio-based)
   template_model.py        — JAX model: TemplateModel class, loss, inference helpers
-  neural_template_model.py — JAX model: NeuralTemplateModel (MLP continuum + explicit lines + GMM alpha prior)
+  neural_template_model.py — JAX model: NeuralTemplateModel (MLP continuum + explicit lines + flow alpha prior)
 scripts/
   train.py            — CLI training utility (argparse, optax, DataLoader bridge)
 notebooks/
@@ -58,9 +58,9 @@ There are two model classes sharing the same z-marginalisation and n(z) learning
 - **Line catalog**: 21 lines including [OII] doublet, Hα/β/γ/δ, [OIII], Ca H&K, Na D, etc.
   Lines outside `[t_wave_min, t_wave_max]` are automatically excluded.
 - **Parameters**: `mlp_weights`, `line_A` (Nt, N_lines), `line_sigma_raw` (N_lines),
-  `log_nz_raw` (Nnz,), plus GMM params `gmm_log_pi`, `gmm_mu`, `gmm_L_raw`.
-- **GMM alpha prior**: K-component GMM on the alpha amplitude vector, added to the
-  per-galaxy per-z log-weight during training only (`gmm_weight · log p_GMM(α)`).
+  `log_nz_raw` (Nnz,), plus normalizing-flow params for the alpha prior.
+- **Flow alpha prior**: an affine-coupling flow maps alpha into a Gaussian latent
+  space and adds `alpha_prior_weight · log p_flow(α)` during training only.
   NOT applied in `compute_z_posterior` — it shapes what templates learn, not inference.
 - **Checkpoint keys**: includes `model_type: 'neural'` in config for auto-detection.
 - **Status**: under development; currently does not outperform TemplateModel.
@@ -124,7 +124,7 @@ python scripts/train.py \
 # Neural template model
 python scripts/train.py \
   --neural-templates \
-  --Nt 4 --mlp-hidden 64 --gmm-components 5 --gmm-weight 0.1 \
+  --Nt 4 --mlp-hidden 64 --alpha-flow-layers 4 --alpha-prior-weight 0.1 \
   --n-spectra 50000 --zmin 0.75 --zmax 1.0 --Nz 1000 \
   --n-epochs 200 --batch-size 8192
 ```
@@ -139,14 +139,13 @@ python scripts/train.py \
 The notebook detects model type via `config['model_type'] == 'neural'`. TemplateModel
 checkpoints have no `model_type` field; NeuralTemplateModel checkpoints have
 `model_type: 'neural'`. Both share `log_nz_raw` and `config` keys; TemplateModel adds
-`T`; NeuralTemplateModel adds `mlp_weights`, `line_A`, `line_sigma_raw`, and GMM keys.
+`T`; NeuralTemplateModel adds `mlp_weights`, `line_A`, `line_sigma_raw`, and flow keys.
 
-## `target_noise` and z recovery
+## `noise_mult` and z recovery
 
-`SpectraDataset` accepts `target_noise` (float, default 0): adds white noise to bring
-each spectrum's SNR down to `sqrt(sum(flux² * ivar)) = target_noise`. Setting this in
-the analysis notebook degrades SNR and can completely break z recovery even when
-templates look fine (O2 doublet visible). **Always set `target_noise=0` in the notebook
+`SpectraDataset` accepts `noise_mult` (float, default 0): adds white noise to bring
+each spectrum's SNR down to `sqrt(sum(flux² * ivar)) = noise_mult`. 
+ **Always set `noise_mult=0` in the notebook
 when checking z recovery, unless the training was also done with the same noise level.**
 
 ## Potential future work

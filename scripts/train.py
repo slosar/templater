@@ -45,6 +45,7 @@ from spectra_loader import SpectraDataset
 from template_model import TemplateModel
 
 try:
+    import torch
     from torch.utils.data import DataLoader
 except ImportError:
     raise ImportError("PyTorch is required for the DataLoader. Install with: pip install torch")
@@ -77,7 +78,7 @@ def parse_args() -> argparse.Namespace:
                       help='alpha parameter for --shape-nofz target distribution')
     data.add_argument('--nofz-beta', type=float, default=40.0,
                       help='beta parameter for --shape-nofz target distribution')
-    data.add_argument('--target-noise', type=float, default=0.0,
+    data.add_argument('--noise-mult', type=float, default=0.0,
                       help='Add noise per batch to bring each spectrum down to this '
                            'total SNR = sqrt(sum(flux^2*ivar)).  Spectra already '
                            'below this SNR are left unchanged.  0 = disabled.')
@@ -103,16 +104,17 @@ def parse_args() -> argparse.Namespace:
     # Neural template options
     model_g.add_argument('--neural-templates', action='store_true',
                          help='Use NeuralTemplateModel: MLP continuum + explicit spectral '
-                              'lines + GMM prior on template amplitudes.')
+                              'lines + a normalizing-flow prior on template amplitudes.')
     model_g.add_argument('--mlp-hidden', type=int, default=64,
                          help='Hidden layer width of the continuum MLP '
                               '(only used with --neural-templates).')
-    model_g.add_argument('--gmm-components', type=int, default=5,
-                         help='Number of GMM components for the alpha prior '
-                              '(only used with --neural-templates).')
-    model_g.add_argument('--gmm-weight', type=float, default=0.1,
-                         help='Weight on log p_GMM(alpha) added to per-galaxy log-weight. '
-                              'Set 0.0 to disable. (only used with --neural-templates).')
+    model_g.add_argument('--alpha-flow-layers', type=int, default=4,
+                         help='Number of affine coupling layers in the alpha prior flow.')
+    model_g.add_argument('--alpha-flow-hidden', type=int, default=64,
+                         help='Hidden width of the alpha-flow conditioner MLP.')
+    model_g.add_argument('--alpha-prior-weight', type=float, default=0.1,
+                         help='Weight on log p_flow(alpha) added to each per-z log-weight. '
+                              'Set 0.0 to disable the alpha prior.')
     model_g.add_argument('--line-noise-init', type=float, default=0.01,
                          help='Std of the random noise for non-[OII] line amplitudes at init. '
                               'The [OII] doublet is always initialised to 1.0. '
@@ -127,12 +129,13 @@ def parse_args() -> argparse.Namespace:
     train = p.add_argument_group("Training")
     train.add_argument('--n-epochs', type=int, default=20, help='Number of training epochs')
     train.add_argument('--freeze-templates', action='store_true',
-                       help='Hold templates fixed; only optimise n(z). '
-                            'Uses a masked optimizer so T receives no gradient updates.')
+                       help='Hold templates fixed; only optimise n(z) and the alpha prior. '
+                            'Precomputes and reuses the full chi2/alpha grid.')
     train.add_argument('--nz-steps', type=int, default=0,
                        help='Extra n(z)-only gradient steps per batch after the main step. '
-                            'Reuses the chi2 matrix from the main step — cheap, no extra '
-                            'template interpolation. Use with --nz-lr for separate rate.')
+                            'Reuses cached chi2 values when templates are frozen; otherwise '
+                            'reuses the chi2 matrix from the main step. Use with --nz-lr '
+                            'for a separate rate.')
     train.add_argument('--nz-lr', type=float, default=None,
                        help='Adam learning rate for the extra n(z)-only steps '
                             '(defaults to --lr when not set).')
@@ -204,7 +207,7 @@ def _compute_flux_mean(ds: SpectraDataset, n_sample: int = 500) -> np.ndarray:
 
 def _compute_snr_stats(ds: SpectraDataset, label: str = "SNR stats",
                        n_sample: int = 2000) -> None:
-    """Sample spectra and print SNR statistics. Respects ds._target_noise."""
+    """Sample spectra and print SNR statistics. Respects ds._noise_mult."""
     rng = np.random.default_rng(0)
     indices = rng.choice(len(ds), size=min(n_sample, len(ds)), replace=False)
     snrs = []
@@ -237,6 +240,95 @@ def _get_zerr(batch: dict, args: argparse.Namespace) -> jax.Array:
     return jnp.maximum(zerr, args.zerr_floor)
 
 
+def _get_zerr_numpy(batch: dict, args: argparse.Namespace) -> np.ndarray:
+    """NumPy equivalent of _get_zerr for precomputed frozen-template batches."""
+    B = batch['flux'].shape[0]
+    if args.zerr_override is not None:
+        zerr = np.full((B,), args.zerr_override, dtype=np.float32)
+    elif 'zerr' in batch:
+        zerr = batch['zerr'].numpy().astype(np.float32)
+    else:
+        print("Warning: no zerr in batch and no --zerr-override; using zerr=1.0")
+        zerr = np.ones((B,), dtype=np.float32)
+    return np.maximum(zerr, args.zerr_floor).astype(np.float32)
+
+
+def _make_mask_like(tree, keep_keys: set[str]) -> dict:
+    """Build an optax mask pytree that keeps the requested top-level keys trainable."""
+    mask = {}
+    for key, value in tree.items():
+        if key in keep_keys:
+            if isinstance(value, dict):
+                mask[key] = jax.tree_util.tree_map(lambda _: True, value)
+            elif isinstance(value, list):
+                mask[key] = jax.tree_util.tree_map(lambda _: True, value)
+            elif isinstance(value, tuple):
+                mask[key] = jax.tree_util.tree_map(lambda _: True, value)
+            else:
+                mask[key] = True
+        else:
+            if isinstance(value, dict):
+                mask[key] = jax.tree_util.tree_map(lambda _: False, value)
+            elif isinstance(value, list):
+                mask[key] = jax.tree_util.tree_map(lambda _: False, value)
+            elif isinstance(value, tuple):
+                mask[key] = jax.tree_util.tree_map(lambda _: False, value)
+            else:
+                mask[key] = False
+    return mask
+
+
+def _load_dataset_batch(ds: SpectraDataset, indices: np.ndarray) -> dict[str, torch.Tensor]:
+    """Materialise a dataset chunk into the same structure produced by DataLoader."""
+    items = [ds[int(i)] for i in indices]
+    batch: dict[str, torch.Tensor] = {
+        'flux': torch.stack([item['flux'] for item in items]),
+        'ivar': torch.stack([item['ivar'] for item in items]),
+        'z': torch.stack([item['z'] for item in items]),
+    }
+    if 'zerr' in items[0]:
+        batch['zerr'] = torch.stack([item['zerr'] for item in items])
+    return batch
+
+
+def _precompute_frozen_cache(
+    ds: SpectraDataset,
+    model,
+    params: dict,
+    args: argparse.Namespace,
+    chunk_size: int,
+) -> dict[str, np.ndarray]:
+    """Precompute chi2(z) and alpha(z) once when templates are frozen."""
+    n_obj = len(ds)
+    chi2_cache = np.empty((n_obj, model.Nz), dtype=np.float32)
+    alpha_cache = np.empty((n_obj, model.Nz, model.Nt), dtype=np.float32)
+    z_cache = np.empty((n_obj,), dtype=np.float32)
+    zerr_cache = np.empty((n_obj,), dtype=np.float32)
+    compute_cache = jax.jit(model.compute_chi2_alpha_grid)
+
+    print(f"Precomputing frozen-template chi2/alpha cache ({n_obj} spectra)...")
+    for start in range(0, n_obj, chunk_size):
+        stop = min(start + chunk_size, n_obj)
+        indices = np.arange(start, stop)
+        batch = _load_dataset_batch(ds, indices)
+        flux = jnp.array(batch['flux'].numpy())
+        ivar = jnp.array(batch['ivar'].numpy())
+        chi2_chunk, alpha_chunk = compute_cache(params, flux, ivar)
+        chi2_cache[start:stop] = np.array(chi2_chunk)
+        alpha_cache[start:stop] = np.array(alpha_chunk)
+        z_cache[start:stop] = batch['z'].numpy().astype(np.float32)
+        zerr_cache[start:stop] = _get_zerr_numpy(batch, args)
+        if start == 0 or stop == n_obj or ((start // chunk_size + 1) % 10 == 0):
+            print(f"  cached {stop}/{n_obj}")
+
+    return {
+        'chi2': chi2_cache,
+        'alpha': alpha_cache,
+        'z': z_cache,
+        'zerr': zerr_cache,
+    }
+
+
 def main() -> None:
     args = parse_args()
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -261,14 +353,14 @@ def main() -> None:
         nofz_alpha=args.nofz_alpha,
         nofz_beta=args.nofz_beta,
         seed=args.seed,
-        target_noise=args.target_noise,
+        noise_mult=args.noise_mult,
     )
     print(f"  {len(ds)} spectra | loader z in [{zmin_loader}, {zmax_loader}]")
-    if args.target_noise > 0:
-        ds._target_noise = 0.0
+    if args.noise_mult > 0:
+        ds._noise_mult = 0.0
         _compute_snr_stats(ds, label="SNR stats (raw)")
-        ds._target_noise = args.target_noise
-        print(f"  target_noise={args.target_noise:.1f}")
+        ds._noise_mult = args.noise_mult
+        print(f"  noise_mult={args.noise_mult:.1f}")
         _compute_snr_stats(ds, label="SNR stats (noisy)")
     else:
         _compute_snr_stats(ds)
@@ -278,15 +370,6 @@ def main() -> None:
             f"Dataset ({len(ds)} spectra) is smaller than batch_size ({args.batch_size}). "
             "Lower --batch-size or increase --n-spectra."
         )
-
-    loader = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        drop_last=True,   # Fixed batch size → no JAX retracing across batches
-        pin_memory=False,
-    )
 
     wave_obs = ds.wave.numpy()
 
@@ -302,11 +385,12 @@ def main() -> None:
             Nnz=args.Nnz,
             template_res_boost=args.template_res_boost,
             mlp_hidden=args.mlp_hidden,
-            gmm_components=args.gmm_components,
-            gmm_weight=args.gmm_weight,
+            alpha_flow_layers=args.alpha_flow_layers,
+            alpha_flow_hidden=args.alpha_flow_hidden,
+            alpha_prior_weight=args.alpha_prior_weight,
         )
         print(f"  NeuralTemplateModel: MLP hidden={args.mlp_hidden}, "
-              f"GMM K={args.gmm_components}, gmm_weight={args.gmm_weight}")
+              f"flow layers={args.alpha_flow_layers}, flow hidden={args.alpha_flow_hidden}")
         print(f"  Active lines ({model.N_lines}): {', '.join(model.active_line_names)}")
     else:
         model = TemplateModel(
@@ -317,8 +401,9 @@ def main() -> None:
             Nz=args.Nz,
             Nnz=args.Nnz,
             template_res_boost=args.template_res_boost,
-            gmm_components=args.gmm_components,
-            gmm_weight=args.gmm_weight,
+            alpha_flow_layers=args.alpha_flow_layers,
+            alpha_flow_hidden=args.alpha_flow_hidden,
+            alpha_prior_weight=args.alpha_prior_weight,
         )
     print(f"  Template grid: {model.Nft} pts, "
           f"{float(model.t_wave[0]):.1f}–{float(model.t_wave[-1]):.1f} Å")
@@ -326,8 +411,8 @@ def main() -> None:
     if zmin_loader != args.zmin or zmax_loader != args.zmax:
         print(f"  (loader cut:   z in [{zmin_loader}, {zmax_loader}])")
     print(f"  n(z) bins:     Nnz={args.Nnz}")
-    if model.gmm_components > 0:
-        print(f"  GMM alpha prior: K={model.gmm_components}, weight={model.gmm_weight}")
+    print(f"  Alpha flow prior: layers={model.alpha_flow_layers}, "
+          f"hidden={model.alpha_flow_hidden}, weight={model.alpha_prior_weight}")
 
     # ---- Initialise or resume ------------------------------------------------
     key = jax.random.PRNGKey(args.seed)
@@ -339,12 +424,6 @@ def main() -> None:
             _, params, start_epoch = NeuralTemplateModel.load_checkpoint(args.resume, wave_obs)
         else:
             _, params, start_epoch = TemplateModel.load_checkpoint(args.resume, wave_obs)
-            if model.gmm_components > 0 and 'gmm_log_pi' not in params:
-                print("  Checkpoint predates GMM — initialising GMM params fresh.")
-                fresh = model.init_params(key, nz_sigma=args.nz_sigma)
-                params['gmm_log_pi'] = fresh['gmm_log_pi']
-                params['gmm_mu']     = fresh['gmm_mu']
-                params['gmm_L_raw']  = fresh['gmm_L_raw']
         start_epoch += 1
         print(f"  Continuing from epoch {start_epoch}")
     elif args.resume_templates_only is not None:
@@ -359,20 +438,18 @@ def main() -> None:
                 'line_A':         ckpt_params['line_A'],
                 'line_sigma_raw': ckpt_params['line_sigma_raw'],
                 'log_nz_raw':     fresh['log_nz_raw'],
-                'gmm_log_pi':     fresh['gmm_log_pi'],
-                'gmm_mu':         fresh['gmm_mu'],
-                'gmm_L_raw':      fresh['gmm_L_raw'],
+                'alpha_flow':     fresh['alpha_flow'],
             }
         else:
             _, ckpt_params, ckpt_epoch = TemplateModel.load_checkpoint(
                 args.resume_templates_only, wave_obs
             )
             fresh = model.init_params(key, nz_sigma=args.nz_sigma)
-            params = {"T": ckpt_params["T"], "log_nz_raw": fresh["log_nz_raw"]}
-            if model.gmm_components > 0:
-                params['gmm_log_pi'] = fresh['gmm_log_pi']
-                params['gmm_mu']     = fresh['gmm_mu']
-                params['gmm_L_raw']  = fresh['gmm_L_raw']
+            params = {
+                "T": ckpt_params["T"],
+                "log_nz_raw": fresh["log_nz_raw"],
+                "alpha_flow": fresh["alpha_flow"],
+            }
         print(f"  Templates from epoch {ckpt_epoch}, n(z) fresh (nz_sigma={args.nz_sigma})")
     else:
         if args.neural_templates:
@@ -387,25 +464,19 @@ def main() -> None:
             params = model.init_params(key, flux_mean=flux_mean, t0_init=args.t0_init,
                                        nz_sigma=args.nz_sigma)
 
-    # ---- Optimiser -----------------------------------------------------------
-    # Always use plain adam.  When --freeze-templates, we stop gradients from
-    # flowing through T inside train_step (see below), so T's gradient is
-    # exactly zero and its adam state never moves — no masked optimizer needed.
-    optimizer = optax.adam(args.lr)
+    if args.freeze_templates:
+        cache_chunk_size = max(args.batch_size, 64)
+        frozen_cache = _precompute_frozen_cache(ds, model, params, args, cache_chunk_size)
+        train_mask = _make_mask_like(params, {'log_nz_raw', 'alpha_flow'})
+        optimizer = optax.masked(optax.adam(args.lr), train_mask)
+    else:
+        frozen_cache = None
+        optimizer = optax.adam(args.lr)
     opt_state = optimizer.init(params)
 
     if args.nz_steps > 0:
         nz_lr = args.nz_lr if args.nz_lr is not None else args.lr
-        if args.neural_templates:
-            # Build mask matching the neural params pytree structure;
-            # only log_nz_raw gets gradient updates in nz_loss.
-            nz_mask = {
-                k: (True if k == 'log_nz_raw'
-                    else jax.tree_util.tree_map(lambda _: False, v))
-                for k, v in params.items()
-            }
-        else:
-            nz_mask = {"T": False, "log_nz_raw": True}
+        nz_mask = _make_mask_like(params, {'log_nz_raw'})
         nz_optimizer = optax.masked(optax.adam(nz_lr), nz_mask)
         nz_opt_state = nz_optimizer.init(params)
 
@@ -414,33 +485,14 @@ def main() -> None:
     template_ortho = args.template_ortho
 
     if args.freeze_templates:
-        if args.neural_templates:
-            _template_keys = {'mlp_weights', 'line_A', 'line_sigma_raw'}
-            @jax.jit
-            def train_step(params, opt_state, flux, ivar, z_prior, zerr):
-                frozen_params = {
-                    k: jax.lax.stop_gradient(v) if k in _template_keys else v
-                    for k, v in params.items()
-                }
-                loss_val, grads = jax.value_and_grad(model.loss)(
-                    frozen_params, flux, ivar, z_prior, zerr, template_l2, template_ortho
-                )
-                updates, new_opt_state = optimizer.update(grads, opt_state)
-                new_params = optax.apply_updates(params, updates)
-                return new_params, new_opt_state, loss_val
-        else:
-            @jax.jit
-            def train_step(params, opt_state, flux, ivar, z_prior, zerr):
-                frozen_params = {
-                    "T": jax.lax.stop_gradient(params["T"]),
-                    "log_nz_raw": params["log_nz_raw"],
-                }
-                loss_val, grads = jax.value_and_grad(model.loss)(
-                    frozen_params, flux, ivar, z_prior, zerr, template_l2, template_ortho
-                )
-                updates, new_opt_state = optimizer.update(grads, opt_state)
-                new_params = optax.apply_updates(params, updates)
-                return new_params, new_opt_state, loss_val
+        @jax.jit
+        def train_step(params, opt_state, chi2_matrix, alpha_matrix, z_prior, zerr):
+            loss_val, grads = jax.value_and_grad(model.alpha_nz_loss)(
+                params, chi2_matrix, alpha_matrix, z_prior, zerr
+            )
+            updates, new_opt_state = optimizer.update(grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            return new_params, new_opt_state, loss_val
     else:
         @jax.jit
         def train_step(params, opt_state, flux, ivar, z_prior, zerr):
@@ -453,24 +505,38 @@ def main() -> None:
 
     # ---- Extra n(z) step functions (only built when needed) ------------------
     if args.nz_steps > 0:
-        @jax.jit
-        def compute_chi2(params, flux, ivar):
-            return model.compute_chi2_matrix(params, flux, ivar)
+        if not args.freeze_templates:
+            @jax.jit
+            def compute_chi2(params, flux, ivar):
+                return model.compute_chi2_matrix(params, flux, ivar)
 
         @jax.jit
         def nz_step(params, nz_opt_state, chi2_matrix, z_prior, zerr):
             loss_val, grads = jax.value_and_grad(model.nz_loss)(
                 params, chi2_matrix, z_prior, zerr
             )
-            updates, new_state = nz_optimizer.update(grads, nz_opt_state)
+            updates, new_state = nz_optimizer.update(grads, nz_opt_state, params)
             new_params = optax.apply_updates(params, updates)
             return new_params, new_state, loss_val
 
     # ---- Training loop -------------------------------------------------------
-    print(f"\nTraining: {args.n_epochs - start_epoch} epochs, "
-          f"{len(loader)} steps/epoch, batch={args.batch_size}")
     if args.freeze_templates:
-        print("  freeze_templates=True  (T is held fixed)")
+        n_steps_per_epoch = len(ds) // args.batch_size
+    else:
+        loader = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            drop_last=True,
+            pin_memory=False,
+        )
+        n_steps_per_epoch = len(loader)
+
+    print(f"\nTraining: {args.n_epochs - start_epoch} epochs, "
+          f"{n_steps_per_epoch} steps/epoch, batch={args.batch_size}")
+    if args.freeze_templates:
+        print("  freeze_templates=True  (templates fixed; reusing cached chi2/alpha grids)")
     if args.nz_steps > 0:
         nz_lr_eff = args.nz_lr if args.nz_lr is not None else args.lr
         print(f"  nz_steps={args.nz_steps}  nz_lr={nz_lr_eff}")
@@ -489,33 +555,63 @@ def main() -> None:
             blind_frac = args.disable_z_prior
         print(f"  blind_frac={blind_frac:.3f}")
 
-        for batch in loader:
-            flux = jnp.array(batch['flux'].numpy())
-            ivar = jnp.array(batch['ivar'].numpy())
-            z_prior = jnp.array(batch['z'].numpy())
-            zerr = _get_zerr(batch, args)
-            if blind_frac > 0.0:
-                mask = np.random.random(args.batch_size) < blind_frac
-                z_center = (args.zmin + args.zmax) / 2.0
-                z_prior = jnp.where(mask, z_center, z_prior)
-                zerr = jnp.where(mask, 100.0, zerr)
+        if args.freeze_templates:
+            n_full = (len(ds) // args.batch_size) * args.batch_size
+            perm = np.random.permutation(len(ds))[:n_full].reshape(-1, args.batch_size)
+            for batch_idx in perm:
+                chi2_mat = jnp.array(frozen_cache['chi2'][batch_idx])
+                alpha_mat = jnp.array(frozen_cache['alpha'][batch_idx])
+                z_prior = jnp.array(frozen_cache['z'][batch_idx])
+                zerr = jnp.array(frozen_cache['zerr'][batch_idx])
+                if blind_frac > 0.0:
+                    mask = np.random.random(args.batch_size) < blind_frac
+                    z_center = (args.zmin + args.zmax) / 2.0
+                    z_prior = jnp.where(mask, z_center, z_prior)
+                    zerr = jnp.where(mask, 100.0, zerr)
 
-            params, opt_state, loss_val = train_step(
-                params, opt_state, flux, ivar, z_prior, zerr
-            )
-            loss_scalar = float(loss_val)
+                params, opt_state, loss_val = train_step(
+                    params, opt_state, chi2_mat, alpha_mat, z_prior, zerr
+                )
+                loss_scalar = float(loss_val)
 
-            if args.nz_steps > 0:
-                chi2_mat = compute_chi2(params, flux, ivar)
-                for _ in range(args.nz_steps):
-                    params, nz_opt_state, _ = nz_step(
-                        params, nz_opt_state, chi2_mat, z_prior, zerr
-                    )
-            epoch_losses.append(loss_scalar)
+                if args.nz_steps > 0:
+                    for _ in range(args.nz_steps):
+                        params, nz_opt_state, _ = nz_step(
+                            params, nz_opt_state, chi2_mat, z_prior, zerr
+                        )
+                epoch_losses.append(loss_scalar)
 
-            if total_steps % args.log_interval == 0:
-                print(f"  epoch {epoch:3d} step {total_steps:5d}:  loss={loss_scalar:.4f}")
-            total_steps += 1
+                if total_steps % args.log_interval == 0:
+                    print(f"  epoch {epoch:3d} step {total_steps:5d}:  loss={loss_scalar:.4f}")
+                total_steps += 1
+        else:
+            for batch in loader:
+                flux = jnp.array(batch['flux'].numpy())
+                ivar = jnp.array(batch['ivar'].numpy())
+                z_prior = jnp.array(batch['z'].numpy())
+                zerr = _get_zerr(batch, args)
+                if blind_frac > 0.0:
+                    mask = np.random.random(args.batch_size) < blind_frac
+                    z_center = (args.zmin + args.zmax) / 2.0
+                    z_prior = jnp.where(mask, z_center, z_prior)
+                    zerr = jnp.where(mask, 100.0, zerr)
+
+                params, opt_state, loss_val = train_step(
+                    params, opt_state, flux, ivar, z_prior, zerr
+                )
+                loss_scalar = float(loss_val)
+
+                if args.nz_steps > 0:
+                    chi2_mat = compute_chi2(params, flux, ivar)
+                    for _ in range(args.nz_steps):
+                        params, nz_opt_state, _ = nz_step(
+                            params, nz_opt_state, chi2_mat, z_prior, zerr
+                        )
+                epoch_losses.append(loss_scalar)
+
+                if total_steps % args.log_interval == 0:
+                    print(f"  epoch {epoch:3d} step {total_steps:5d}:  loss={loss_scalar:.4f}")
+                total_steps += 1
 
         elapsed = time.time() - t0
         mean_loss = float(np.mean(epoch_losses))

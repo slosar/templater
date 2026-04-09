@@ -20,6 +20,7 @@ import optax
 
 from neural_template_model import NeuralTemplateModel
 from template_model import TemplateModel
+from alpha_flow import save_alpha_flow_params
 
 
 def latest_checkpoint(checkpoint_dir: str) -> str:
@@ -50,20 +51,18 @@ def _copy_auxiliary_params(
     source_params: dict,
     target_params: dict,
     *,
-    gmm_mode: str,
+    alpha_prior_mode: str,
 ) -> dict:
     """Copy checkpoint parameters that are not part of the direct template fit."""
     out = dict(target_params)
     if "log_nz_raw" in source_params:
         out["log_nz_raw"] = source_params["log_nz_raw"]
 
-    if gmm_mode not in {"copy_if_present", "reinit"}:
-        raise ValueError(f"Unsupported gmm_mode={gmm_mode!r}")
+    if alpha_prior_mode not in {"copy_if_present", "reinit"}:
+        raise ValueError(f"Unsupported alpha_prior_mode={alpha_prior_mode!r}")
 
-    if gmm_mode == "copy_if_present":
-        for key in ("gmm_log_pi", "gmm_mu", "gmm_L_raw"):
-            if key in source_params and key in out:
-                out[key] = source_params[key]
+    if alpha_prior_mode == "copy_if_present" and "alpha_flow" in source_params:
+        out["alpha_flow"] = source_params["alpha_flow"]
     return out
 
 
@@ -116,7 +115,7 @@ def fit_neural_to_template_checkpoint(
     lr: float = 3e-2,
     n_steps: int = 3000,
     seed: int = 0,
-    gmm_mode: str = "copy_if_present",
+    alpha_prior_mode: str = "copy_if_present",
     line_amp_init: float = 0.01,
 ) -> tuple[NeuralTemplateModel, dict, dict[str, Any]]:
     """Fit NeuralTemplateModel directly to a saved TemplateModel checkpoint."""
@@ -125,7 +124,6 @@ def fit_neural_to_template_checkpoint(
     centered = target - jnp.mean(target, axis=1, keepdims=True)
     variance = float(jnp.mean(centered ** 2))
 
-    gmm_components = template_model.gmm_components if template_model.gmm_components > 0 else 1
     neural_model = NeuralTemplateModel(
         Nt=template_model.Nt,
         wave_obs=wave_obs,
@@ -135,15 +133,16 @@ def fit_neural_to_template_checkpoint(
         Nnz=template_model.Nnz,
         template_res_boost=template_model.template_res_boost,
         mlp_hidden=mlp_hidden,
-        gmm_components=gmm_components,
-        gmm_weight=0.0,
+        alpha_flow_layers=template_model.alpha_flow_layers,
+        alpha_flow_hidden=template_model.alpha_flow_hidden,
+        alpha_prior_weight=0.0,
     )
     params = neural_model.init_params(
         jax.random.PRNGKey(seed),
         nz_sigma=0.05,
         line_amp_init=line_amp_init,
     )
-    params = _copy_auxiliary_params(template_params, params, gmm_mode=gmm_mode)
+    params = _copy_auxiliary_params(template_params, params, alpha_prior_mode=alpha_prior_mode)
 
     loss_fn = _fit_loss(neural_model, target, variance)
     tx = optax.adam(lr)
@@ -199,10 +198,8 @@ def export_fitted_neural_checkpoint(
         "line_A": np.array(params["line_A"]),
         "line_sigma_raw": np.array(params["line_sigma_raw"]),
         "log_nz_raw": np.array(params["log_nz_raw"]),
-        "gmm_log_pi": np.array(params["gmm_log_pi"]),
-        "gmm_mu": np.array(params["gmm_mu"]),
-        "gmm_L_raw": np.array(params["gmm_L_raw"]),
     }
+    save_alpha_flow_params(arrays, params["alpha_flow"])
     for i, (W, b) in enumerate(params["mlp_weights"]):
         arrays[f"mlp_W{i}"] = np.array(W)
         arrays[f"mlp_b{i}"] = np.array(b)

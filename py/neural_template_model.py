@@ -14,10 +14,8 @@ where:
   - A_{kj}: learnable amplitude of line j in template k (positive = emission, negative = absorption).
   - σ_j  : learnable per-line width (softplus + 1 Å floor), shared across templates.
 
-A Gaussian Mixture Model (GMM) on the amplitude vector α acts as a learned prior on
-galaxy type, adding  gmm_weight · log p_GMM(α)  to the per-galaxy per-z log-weight.
-This penalises unlikely combinations of templates and encourages discrete galaxy populations
-to emerge.
+A normalizing flow on the amplitude vector α maps fitted amplitudes into a
+Gaussian latent space and adds a learned alpha prior during training.
 
 The z-marginalisation, n(z) learning, and analytical α solve are unchanged from TemplateModel.
 """
@@ -30,6 +28,16 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from alpha_flow import (
+    alpha_flow_inverse,
+    alpha_flow_log_prob,
+    alpha_flow_sample,
+    init_alpha_flow_params,
+    load_alpha_flow_params,
+    make_alpha_flow_masks,
+    save_alpha_flow_params,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -102,62 +110,6 @@ def _mlp_apply(weights: list[tuple], x: jax.Array) -> jax.Array:
 
 
 # ---------------------------------------------------------------------------
-# GMM helpers
-# ---------------------------------------------------------------------------
-
-def _make_L(L_raw: jax.Array) -> jax.Array:
-    """Convert unconstrained (K, Nt, Nt) → lower-triangular with positive diagonal.
-
-    Off-diagonal elements are zeroed; diagonal is passed through softplus + 1e-3.
-    """
-    Nt = L_raw.shape[-1]
-    eye = jnp.eye(Nt)
-    L = jnp.tril(L_raw)                                         # zero upper triangle
-    diag_raw = (L_raw * eye[None]).sum(axis=-1)                  # (K, Nt) raw diagonal
-    diag_pos = jax.nn.softplus(diag_raw) + 1e-3                  # (K, Nt) positive
-    # Replace diagonal: off-diagonal from L, diagonal from diag_pos
-    diag_mat = jnp.einsum('ki,ij->kij', diag_pos, eye)           # (K, Nt, Nt)
-    off_mask = (1.0 - eye)[None]                                  # (1, Nt, Nt)
-    return L * off_mask + diag_mat
-
-
-def _gmm_log_prob(
-    alpha: jax.Array,
-    log_pi: jax.Array,
-    mu: jax.Array,
-    L_raw: jax.Array,
-) -> jax.Array:
-    """Log probability of alpha under a GMM with Cholesky-parameterised covariances.
-
-    Parameters
-    ----------
-    alpha  : (Nt,)
-    log_pi : (K,)  unnormalised log mixture weights
-    mu     : (K, Nt)
-    L_raw  : (K, Nt, Nt)  unconstrained → L via _make_L (Σ_k = L_k @ L_k^T)
-
-    Returns
-    -------
-    Scalar log p(alpha).
-    """
-    K, Nt = mu.shape
-    log_pi_norm = jax.nn.log_softmax(log_pi)    # (K,)
-    L = _make_L(L_raw)                           # (K, Nt, Nt)
-
-    def component_lp(log_pi_k, mu_k, L_k):
-        diff = alpha - mu_k                      # (Nt,)
-        # Solve L_k z = diff  →  z = L_k^{-1} diff,  Mahalanobis = ||z||²
-        z = jax.scipy.linalg.solve_triangular(L_k, diff, lower=True)
-        mahal = jnp.sum(z ** 2)
-        log_det_L = jnp.sum(jnp.log(jnp.diag(L_k)))   # log|L| = Σ log diag(L)
-        # log N(alpha; mu_k, L_k L_k^T)
-        return log_pi_k - 0.5 * (Nt * jnp.log(2.0 * jnp.pi) + 2.0 * log_det_L + mahal)
-
-    log_components = jax.vmap(component_lp)(log_pi_norm, mu, L)  # (K,)
-    return jax.nn.logsumexp(log_components)
-
-
-# ---------------------------------------------------------------------------
 # Main model class
 # ---------------------------------------------------------------------------
 
@@ -173,9 +125,9 @@ class NeuralTemplateModel:
     Nnz              : Bins in the learnable n(z) distribution.
     template_res_boost: Divide template pixel spacing by this factor.
     mlp_hidden       : Hidden layer width of the continuum MLP.
-    gmm_components   : Number of GMM components for the α prior.
-    gmm_weight       : Weight on log p_GMM(α) added to per-galaxy log-weight.
-                       Set to 0.0 to disable the GMM prior entirely.
+    alpha_flow_layers: Number of affine coupling layers in the alpha flow.
+    alpha_flow_hidden: Hidden width of the coupling-layer conditioner MLP.
+    alpha_prior_weight: Weight on log p_flow(α) added to per-galaxy log-weight.
     """
 
     def __init__(
@@ -188,8 +140,9 @@ class NeuralTemplateModel:
         Nnz: int = 50,
         template_res_boost: float = 1.2,
         mlp_hidden: int = 64,
-        gmm_components: int = 5,
-        gmm_weight: float = 0.1,
+        alpha_flow_layers: int = 4,
+        alpha_flow_hidden: int = 64,
+        alpha_prior_weight: float = 0.1,
     ) -> None:
         self.Nt = Nt
         self.Nf = int(len(wave_obs))
@@ -201,8 +154,10 @@ class NeuralTemplateModel:
         self.wave_max = float(wave_obs.max())
         self.template_res_boost = float(template_res_boost)
         self.mlp_hidden = int(mlp_hidden)
-        self.gmm_components = int(gmm_components)
-        self.gmm_weight = float(gmm_weight)
+        self.alpha_flow_layers = int(alpha_flow_layers)
+        self.alpha_flow_hidden = int(alpha_flow_hidden)
+        self.alpha_prior_weight = float(alpha_prior_weight)
+        self.alpha_flow_masks = make_alpha_flow_masks(self.Nt, self.alpha_flow_layers)
 
         # ---- Template rest-frame wavelength grid ----------------------------
         t_wave_min = self.wave_min / (1.0 + zmax)
@@ -276,11 +231,9 @@ class NeuralTemplateModel:
         line_A         : (Nt, N_lines) — line amplitudes
         line_sigma_raw : (N_lines,) — unconstrained line widths (σ = softplus + 0.1 Å)
         log_nz_raw     : (Nnz,) — unnormalised log n(z)
-        gmm_log_pi     : (K,) — unnormalised log GMM mixture weights
-        gmm_mu         : (K, Nt) — GMM component means
-        gmm_L_raw      : (K, Nt, Nt) — unconstrained Cholesky factors
+        alpha_flow     : normalizing-flow parameters for p(alpha)
         """
-        key, k_mlp, k_lines, k_gmm = jax.random.split(key, 4)
+        key, k_mlp, k_lines, k_flow = jax.random.split(key, 4)
 
         # MLP: He init
         mlp_weights = _mlp_init(k_mlp, self.mlp_layer_sizes)
@@ -309,24 +262,14 @@ class NeuralTemplateModel:
         else:
             log_nz_raw = jnp.zeros(self.Nnz)
 
-        # GMM: uniform weights, randomly scattered means, identity covariance
-        # softplus^{-1}(1.0) = log(e - 1) ≈ 0.5413  →  diagonal starts at 1.0
-        # Means must be initialised randomly to break symmetry — if all K components
-        # start at the same point they receive identical gradients and never diverge.
-        K, Nt = self.gmm_components, self.Nt
-        diag_init = float(np.log(np.exp(10.0) - 1.0))  # softplus^{-1}(10.0) → σ≈10
-        gmm_log_pi = jnp.zeros(K)
-        gmm_mu     = jax.random.normal(k_gmm, (K, Nt)) * 30.0
-        gmm_L_raw  = jnp.zeros((K, Nt, Nt)) + diag_init * jnp.eye(Nt)[None]
-
         return {
             'mlp_weights':    mlp_weights,
             'line_A':         line_A,
             'line_sigma_raw': line_sigma_raw,
             'log_nz_raw':     log_nz_raw,
-            'gmm_log_pi':     gmm_log_pi,
-            'gmm_mu':         gmm_mu,
-            'gmm_L_raw':      gmm_L_raw,
+            'alpha_flow': init_alpha_flow_params(
+                k_flow, self.Nt, self.alpha_flow_layers, self.alpha_flow_hidden
+            ),
         }
 
     # -------------------------------------------------------------------------
@@ -442,7 +385,7 @@ class NeuralTemplateModel:
         flux_ivar_flux = (flux * ivar * flux).sum(axis=-1)     # (B,)
         Nt     = self.Nt
         eye_Nt = jnp.eye(Nt)
-        gmm_weight = self.gmm_weight   # Python float → traced as compile-time constant
+        alpha_prior_weight = self.alpha_prior_weight
 
         def scan_body(carry, x):
             log_max, sum_exp = carry                 # (B,)
@@ -459,14 +402,14 @@ class NeuralTemplateModel:
 
             log_w = log_nz_z + log_prior_z_col - 0.5 * chi2    # (B,)
 
-            # GMM prior on alpha (compiled away when gmm_weight == 0.0)
-            if gmm_weight > 0.0:
+            # Flow prior on alpha (compiled away when alpha_prior_weight == 0.0)
+            if alpha_prior_weight > 0.0:
                 log_p_alpha = jax.vmap(
-                    lambda a: _gmm_log_prob(
-                        a, params['gmm_log_pi'], params['gmm_mu'], params['gmm_L_raw']
+                    lambda a: alpha_flow_log_prob(
+                        params['alpha_flow'], a, self.alpha_flow_masks
                     )
                 )(alpha)                                          # (B,)
-                log_w = log_w + gmm_weight * log_p_alpha
+                log_w = log_w + alpha_prior_weight * log_p_alpha
 
             # Numerically stable online logsumexp
             new_max = jnp.maximum(log_max, log_w)
@@ -495,13 +438,13 @@ class NeuralTemplateModel:
 
         return loss_val
 
-    def compute_chi2_matrix(
+    def compute_chi2_alpha_grid(
         self,
         params: dict,
         flux: jax.Array,
         ivar: jax.Array,
-    ) -> jax.Array:
-        """Per-galaxy chi2_min at every z.  Returns (B, Nz)."""
+    ) -> tuple[jax.Array, jax.Array]:
+        """Per-galaxy chi2_min and alpha at every z."""
         T     = self._build_templates(params)
         T_all = self._interpolate_templates(T)
         flux_ivar_flux = (flux * ivar * flux).sum(axis=-1)
@@ -513,10 +456,20 @@ class NeuralTemplateModel:
             b = (T_ivar * flux[:, None, :]).sum(axis=-1)
             alpha = jax.vmap(jnp.linalg.solve)(A, b)
             chi2 = flux_ivar_flux - (b * alpha).sum(axis=-1)
-            return _, chi2
+            return _, (chi2, alpha)
 
-        _, chi2_mat = jax.lax.scan(jax.remat(scan_body), None, T_all)  # (Nz, B)
-        return chi2_mat.T   # (B, Nz)
+        _, (chi2_mat, alpha_mat) = jax.lax.scan(jax.remat(scan_body), None, T_all)
+        return chi2_mat.T, alpha_mat.transpose(1, 0, 2)
+
+    def compute_chi2_matrix(
+        self,
+        params: dict,
+        flux: jax.Array,
+        ivar: jax.Array,
+    ) -> jax.Array:
+        """Per-galaxy chi2_min at every z.  Returns (B, Nz)."""
+        chi2_mat, _ = self.compute_chi2_alpha_grid(params, flux, ivar)
+        return chi2_mat
 
     def nz_loss(
         self,
@@ -538,6 +491,35 @@ class NeuralTemplateModel:
         dz = self.zgrid[None, :] - z_prior[:, None]
         log_prior = -0.5 * (dz / zerr_safe) ** 2
         log_w = log_nz_at_z[None, :] + log_prior - 0.5 * chi2_matrix
+        return -jnp.mean(jax.nn.logsumexp(log_w, axis=-1))
+
+    def alpha_nz_loss(
+        self,
+        params: dict,
+        chi2_matrix: jax.Array,
+        alpha_matrix: jax.Array,
+        z_prior: jax.Array,
+        zerr: jax.Array,
+    ) -> jax.Array:
+        """Joint n(z) + alpha-prior loss from cached chi2/alpha grids."""
+        log_nz_norm = jax.nn.log_softmax(params['log_nz_raw'])
+        log_nz_at_z = (
+            log_nz_norm[self.nz_lo_idx] * (1.0 - self.nz_weight)
+            + log_nz_norm[self.nz_lo_idx + 1] * self.nz_weight
+        )
+        zerr_safe = jnp.maximum(zerr, 1e-8)[:, None]
+        dz = self.zgrid[None, :] - z_prior[:, None]
+        log_prior = -0.5 * (dz / zerr_safe) ** 2
+        log_w = log_nz_at_z[None, :] + log_prior - 0.5 * chi2_matrix
+        if self.alpha_prior_weight > 0.0:
+            log_p_alpha = jax.vmap(
+                jax.vmap(
+                    lambda a: alpha_flow_log_prob(
+                        params['alpha_flow'], a, self.alpha_flow_masks
+                    )
+                )
+            )(alpha_matrix)
+            log_w = log_w + self.alpha_prior_weight * log_p_alpha
         return -jnp.mean(jax.nn.logsumexp(log_w, axis=-1))
 
     # -------------------------------------------------------------------------
@@ -600,6 +582,27 @@ class NeuralTemplateModel:
 
         return jax.vmap(single)(flux, ivar, z_vals)
 
+    def alpha_to_latent(
+        self,
+        params: dict,
+        alpha: jax.Array,
+    ) -> jax.Array:
+        """Map alpha samples to the flow latent space."""
+        return jax.vmap(
+            lambda a: alpha_flow_inverse(params['alpha_flow'], a, self.alpha_flow_masks)[0]
+        )(alpha)
+
+    def sample_alpha_prior(
+        self,
+        params: dict,
+        key: jax.Array,
+        n_samples: int,
+    ) -> jax.Array:
+        """Draw alpha samples from the learned flow prior."""
+        return alpha_flow_sample(
+            params['alpha_flow'], key, self.Nt, self.alpha_flow_masks, n_samples
+        )
+
     # -------------------------------------------------------------------------
     # Checkpoint helpers
     # -------------------------------------------------------------------------
@@ -618,8 +621,9 @@ class NeuralTemplateModel:
             'Nf':                 self.Nf,
             'template_res_boost': self.template_res_boost,
             'mlp_hidden':         self.mlp_hidden,
-            'gmm_components':     self.gmm_components,
-            'gmm_weight':         self.gmm_weight,
+            'alpha_flow_layers':  self.alpha_flow_layers,
+            'alpha_flow_hidden':  self.alpha_flow_hidden,
+            'alpha_prior_weight': self.alpha_prior_weight,
             'N_lines':            self.N_lines,
         }
 
@@ -629,11 +633,9 @@ class NeuralTemplateModel:
             'line_A':         np.array(params['line_A']),
             'line_sigma_raw': np.array(params['line_sigma_raw']),
             'log_nz_raw':     np.array(params['log_nz_raw']),
-            'gmm_log_pi':     np.array(params['gmm_log_pi']),
-            'gmm_mu':         np.array(params['gmm_mu']),
-            'gmm_L_raw':      np.array(params['gmm_L_raw']),
             'config':         json.dumps(self.config() | {'epoch': epoch}),
         }
+        save_alpha_flow_params(flat, params['alpha_flow'])
         for i, (W, b) in enumerate(params['mlp_weights']):
             flat[f'mlp_W{i}'] = np.array(W)
             flat[f'mlp_b{i}'] = np.array(b)
@@ -656,8 +658,9 @@ class NeuralTemplateModel:
             Nnz=cfg['Nnz'],
             template_res_boost=cfg.get('template_res_boost', 1.0),
             mlp_hidden=cfg.get('mlp_hidden', 64),
-            gmm_components=cfg.get('gmm_components', 5),
-            gmm_weight=cfg.get('gmm_weight', 0.1),
+            alpha_flow_layers=cfg.get('alpha_flow_layers', 4),
+            alpha_flow_hidden=cfg.get('alpha_flow_hidden', 64),
+            alpha_prior_weight=cfg.get('alpha_prior_weight', 0.1),
         )
         # Reconstruct MLP weights list
         mlp_weights = []
@@ -671,8 +674,14 @@ class NeuralTemplateModel:
             'line_A':         jnp.array(ckpt['line_A']),
             'line_sigma_raw': jnp.array(ckpt['line_sigma_raw']),
             'log_nz_raw':     jnp.array(ckpt['log_nz_raw']),
-            'gmm_log_pi':     jnp.array(ckpt['gmm_log_pi']),
-            'gmm_mu':         jnp.array(ckpt['gmm_mu']),
-            'gmm_L_raw':      jnp.array(ckpt['gmm_L_raw']),
         }
+        alpha_flow = load_alpha_flow_params(ckpt)
+        if alpha_flow is None:
+            alpha_flow = init_alpha_flow_params(
+                jax.random.PRNGKey(0),
+                model.Nt,
+                model.alpha_flow_layers,
+                model.alpha_flow_hidden,
+            )
+        params['alpha_flow'] = alpha_flow
         return model, params, int(cfg['epoch'])

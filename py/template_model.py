@@ -18,6 +18,8 @@ distribution and a Gaussian redshift prior from the catalog:
 
 chi2_iz is evaluated at the analytically optimal alpha (linear solve per z).
 The chi2 identity chi2_min = flux^T V flux - b^T alpha avoids storing residuals.
+An optional normalizing flow maps alpha into a Gaussian latent space and provides
+an alpha prior during training.
 
 Usage
 -----
@@ -40,41 +42,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-
-# ---------------------------------------------------------------------------
-# GMM helpers (shared logic with NeuralTemplateModel)
-# ---------------------------------------------------------------------------
-
-def _make_L(L_raw: jax.Array) -> jax.Array:
-    """Unconstrained (K, Nt, Nt) → lower-triangular with positive diagonal."""
-    Nt = L_raw.shape[-1]
-    eye = jnp.eye(Nt)
-    L = jnp.tril(L_raw)
-    diag_raw = (L_raw * eye[None]).sum(axis=-1)          # (K, Nt)
-    diag_pos = jax.nn.softplus(diag_raw) + 1e-3
-    diag_mat = jnp.einsum('ki,ij->kij', diag_pos, eye)  # (K, Nt, Nt)
-    return L * (1.0 - eye)[None] + diag_mat
-
-
-def _gmm_log_prob(
-    alpha: jax.Array,
-    log_pi: jax.Array,
-    mu: jax.Array,
-    L_raw: jax.Array,
-) -> jax.Array:
-    """Log probability of alpha under a GMM with Cholesky-parameterised covariances."""
-    K, Nt = mu.shape
-    log_pi_norm = jax.nn.log_softmax(log_pi)
-    L = _make_L(L_raw)
-
-    def component_lp(log_pi_k, mu_k, L_k):
-        diff = alpha - mu_k
-        z = jax.scipy.linalg.solve_triangular(L_k, diff, lower=True)
-        log_det_L = jnp.sum(jnp.log(jnp.diag(L_k)))
-        return log_pi_k - 0.5 * (Nt * jnp.log(2.0 * jnp.pi) + 2.0 * log_det_L + jnp.sum(z ** 2))
-
-    log_components = jax.vmap(component_lp)(log_pi_norm, mu, L)
-    return jax.nn.logsumexp(log_components)
+from alpha_flow import (
+    alpha_flow_inverse,
+    alpha_flow_log_prob,
+    alpha_flow_sample,
+    init_alpha_flow_params,
+    load_alpha_flow_params,
+    make_alpha_flow_masks,
+    save_alpha_flow_params,
+)
 
 
 class TemplateModel:
@@ -103,8 +79,9 @@ class TemplateModel:
         Nz: int,
         Nnz: int = 50,
         template_res_boost: float = 1.2,
-        gmm_components: int = 0,
-        gmm_weight: float = 0.1,
+        alpha_flow_layers: int = 4,
+        alpha_flow_hidden: int = 64,
+        alpha_prior_weight: float = 0.1,
     ) -> None:
         self.Nt = Nt
         self.Nf = int(len(wave_obs))
@@ -115,8 +92,10 @@ class TemplateModel:
         self.wave_min = float(wave_obs.min())
         self.wave_max = float(wave_obs.max())
         self.template_res_boost = float(template_res_boost)
-        self.gmm_components = int(gmm_components)
-        self.gmm_weight = float(gmm_weight)
+        self.alpha_flow_layers = int(alpha_flow_layers)
+        self.alpha_flow_hidden = int(alpha_flow_hidden)
+        self.alpha_prior_weight = float(alpha_prior_weight)
+        self.alpha_flow_masks = make_alpha_flow_masks(self.Nt, self.alpha_flow_layers)
 
         # ---- Template rest-frame wavelength grid --------------------------------
         # Must cover wave_obs[f]/(1+z) for all z in [zmin, zmax].
@@ -215,17 +194,14 @@ class TemplateModel:
         else:
             log_nz_raw = jnp.zeros(self.Nnz)
 
-        params = {"T": T, "log_nz_raw": log_nz_raw}
-
-        if self.gmm_components > 0:
-            key, k_gmm = jax.random.split(key_noise)
-            K, Nt = self.gmm_components, self.Nt
-            diag_init = float(np.log(np.exp(10.0) - 1.0))  # softplus^{-1}(10.0) → σ≈10
-            params['gmm_log_pi'] = jnp.zeros(K)
-            params['gmm_mu']     = jax.random.normal(k_gmm, (K, Nt)) * 30.0
-            params['gmm_L_raw']  = jnp.zeros((K, Nt, Nt)) + diag_init * jnp.eye(Nt)[None]
-
-        return params
+        key, k_flow = jax.random.split(key_noise)
+        return {
+            "T": T,
+            "log_nz_raw": log_nz_raw,
+            "alpha_flow": init_alpha_flow_params(
+                k_flow, self.Nt, self.alpha_flow_layers, self.alpha_flow_hidden
+            ),
+        }
 
     # -------------------------------------------------------------------------
     # Interpolation
@@ -320,7 +296,7 @@ class TemplateModel:
 
         Nt = self.Nt
         eye_Nt = jnp.eye(Nt)
-        gmm_weight = self.gmm_weight
+        alpha_prior_weight = self.alpha_prior_weight
 
         def scan_body(carry, x):
             log_max, sum_exp = carry          # each (B,)
@@ -343,14 +319,14 @@ class TemplateModel:
             # Log weight at this z for each galaxy
             log_w = log_nz_z + log_prior_z - 0.5 * chi2       # (B,)
 
-            # GMM prior on alpha (compiled away when gmm_components == 0)
-            if self.gmm_components > 0 and gmm_weight > 0.0:
+            # Flow prior on alpha (compiled away when alpha_prior_weight == 0)
+            if alpha_prior_weight > 0.0:
                 log_p_alpha = jax.vmap(
-                    lambda a: _gmm_log_prob(
-                        a, params['gmm_log_pi'], params['gmm_mu'], params['gmm_L_raw']
+                    lambda a: alpha_flow_log_prob(
+                        params["alpha_flow"], a, self.alpha_flow_masks
                     )
                 )(alpha)                                         # (B,)
-                log_w = log_w + gmm_weight * log_p_alpha
+                log_w = log_w + alpha_prior_weight * log_p_alpha
 
             # Numerically stable online logsumexp update
             new_max = jnp.maximum(log_max, log_w)
@@ -383,13 +359,13 @@ class TemplateModel:
 
         return loss_val
 
-    def compute_chi2_matrix(
+    def compute_chi2_alpha_grid(
         self,
         params: dict,
         flux: jax.Array,
         ivar: jax.Array,
-    ) -> jax.Array:
-        """Per-galaxy chi2_min at every z in the search grid.
+    ) -> tuple[jax.Array, jax.Array]:
+        """Per-galaxy chi2_min and alpha at every z in the search grid.
 
         Parameters
         ----------
@@ -399,7 +375,8 @@ class TemplateModel:
 
         Returns
         -------
-        chi2_matrix : (B, Nz)  — chi2_min[b, j] at zgrid[j], no n(z) or z-prior.
+        chi2_matrix : (B, Nz)
+        alpha_matrix : (B, Nz, Nt)
         """
         T_all = self._interpolate_templates(params["T"])   # (Nz, Nt, Nf)
         flux_ivar_flux = (flux * ivar * flux).sum(axis=-1)
@@ -411,12 +388,22 @@ class TemplateModel:
             b = (T_ivar * flux[:, None, :]).sum(axis=-1)
             alpha = jax.vmap(jnp.linalg.solve)(A, b)
             chi2 = flux_ivar_flux - (b * alpha).sum(axis=-1)   # (B,)
-            return _, chi2
+            return _, (chi2, alpha)
 
-        _, chi2_matrix = jax.lax.scan(
+        _, (chi2_matrix, alpha_matrix) = jax.lax.scan(
             jax.remat(scan_body), None, T_all
-        )   # (Nz, B)
-        return chi2_matrix.T   # (B, Nz)
+        )   # (Nz, B), (Nz, B, Nt)
+        return chi2_matrix.T, alpha_matrix.transpose(1, 0, 2)
+
+    def compute_chi2_matrix(
+        self,
+        params: dict,
+        flux: jax.Array,
+        ivar: jax.Array,
+    ) -> jax.Array:
+        """Per-galaxy chi2_min at every z in the search grid."""
+        chi2_matrix, _ = self.compute_chi2_alpha_grid(params, flux, ivar)
+        return chi2_matrix
 
     def nz_loss(
         self,
@@ -450,6 +437,35 @@ class TemplateModel:
         dz = self.zgrid[None, :] - z_prior[:, None]
         log_prior = -0.5 * (dz / zerr_safe) ** 2   # (B, Nz)
         log_w = log_nz_at_z[None, :] + log_prior - 0.5 * chi2_matrix   # (B, Nz)
+        return -jnp.mean(jax.nn.logsumexp(log_w, axis=-1))
+
+    def alpha_nz_loss(
+        self,
+        params: dict,
+        chi2_matrix: jax.Array,
+        alpha_matrix: jax.Array,
+        z_prior: jax.Array,
+        zerr: jax.Array,
+    ) -> jax.Array:
+        """Joint n(z) + alpha-prior loss from precomputed chi2/alpha grids."""
+        log_nz_norm = jax.nn.log_softmax(params["log_nz_raw"])
+        log_nz_at_z = (
+            log_nz_norm[self.nz_lo_idx] * (1.0 - self.nz_weight)
+            + log_nz_norm[self.nz_lo_idx + 1] * self.nz_weight
+        )
+        zerr_safe = jnp.maximum(zerr, 1e-8)[:, None]
+        dz = self.zgrid[None, :] - z_prior[:, None]
+        log_prior = -0.5 * (dz / zerr_safe) ** 2
+        log_w = log_nz_at_z[None, :] + log_prior - 0.5 * chi2_matrix
+        if self.alpha_prior_weight > 0.0:
+            log_p_alpha = jax.vmap(
+                jax.vmap(
+                    lambda a: alpha_flow_log_prob(
+                        params["alpha_flow"], a, self.alpha_flow_masks
+                    )
+                )
+            )(alpha_matrix)
+            log_w = log_w + self.alpha_prior_weight * log_p_alpha
         return -jnp.mean(jax.nn.logsumexp(log_w, axis=-1))
 
     # -------------------------------------------------------------------------
@@ -533,6 +549,27 @@ class TemplateModel:
 
         return jax.vmap(single)(flux, ivar, z_vals)   # (B, Nt)
 
+    def alpha_to_latent(
+        self,
+        params: dict,
+        alpha: jax.Array,
+    ) -> jax.Array:
+        """Map alpha samples to the flow latent space."""
+        return jax.vmap(
+            lambda a: alpha_flow_inverse(params["alpha_flow"], a, self.alpha_flow_masks)[0]
+        )(alpha)
+
+    def sample_alpha_prior(
+        self,
+        params: dict,
+        key: jax.Array,
+        n_samples: int,
+    ) -> jax.Array:
+        """Draw alpha samples from the learned flow prior."""
+        return alpha_flow_sample(
+            params["alpha_flow"], key, self.Nt, self.alpha_flow_masks, n_samples
+        )
+
     # -------------------------------------------------------------------------
     # Checkpoint helpers
     # -------------------------------------------------------------------------
@@ -550,8 +587,9 @@ class TemplateModel:
             "wave_max": self.wave_max,
             "Nf": self.Nf,
             "template_res_boost": self.template_res_boost,
-            "gmm_components": self.gmm_components,
-            "gmm_weight": self.gmm_weight,
+            "alpha_flow_layers": self.alpha_flow_layers,
+            "alpha_flow_hidden": self.alpha_flow_hidden,
+            "alpha_prior_weight": self.alpha_prior_weight,
         }
 
     def save_checkpoint(self, params: dict, epoch: int, path: str) -> None:
@@ -561,10 +599,7 @@ class TemplateModel:
             "log_nz_raw": np.array(params["log_nz_raw"]),
             "config": json.dumps(self.config() | {"epoch": epoch}),
         }
-        if self.gmm_components > 0:
-            arrays["gmm_log_pi"] = np.array(params["gmm_log_pi"])
-            arrays["gmm_mu"]     = np.array(params["gmm_mu"])
-            arrays["gmm_L_raw"]  = np.array(params["gmm_L_raw"])
+        save_alpha_flow_params(arrays, params["alpha_flow"])
         np.savez(path, **arrays)
 
     @staticmethod
@@ -583,15 +618,21 @@ class TemplateModel:
             Nz=cfg["Nz"],
             Nnz=cfg["Nnz"],
             template_res_boost=cfg.get("template_res_boost", 1.0),
-            gmm_components=cfg.get("gmm_components", 0),
-            gmm_weight=cfg.get("gmm_weight", 0.1),
+            alpha_flow_layers=cfg.get("alpha_flow_layers", 4),
+            alpha_flow_hidden=cfg.get("alpha_flow_hidden", 64),
+            alpha_prior_weight=cfg.get("alpha_prior_weight", 0.1),
         )
         params = {
             "T": jnp.array(ckpt["T"]),
             "log_nz_raw": jnp.array(ckpt["log_nz_raw"]),
         }
-        if model.gmm_components > 0:
-            params["gmm_log_pi"] = jnp.array(ckpt["gmm_log_pi"])
-            params["gmm_mu"]     = jnp.array(ckpt["gmm_mu"])
-            params["gmm_L_raw"]  = jnp.array(ckpt["gmm_L_raw"])
+        alpha_flow = load_alpha_flow_params(ckpt)
+        if alpha_flow is None:
+            alpha_flow = init_alpha_flow_params(
+                jax.random.PRNGKey(0),
+                model.Nt,
+                model.alpha_flow_layers,
+                model.alpha_flow_hidden,
+            )
+        params["alpha_flow"] = alpha_flow
         return model, params, int(cfg["epoch"])

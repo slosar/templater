@@ -38,8 +38,16 @@ lines at 21 known rest-frame wavelengths ([OII], Hα, [OIII], Ca H&K, etc.):
 T_k(λ) = MLP(λ_norm)[k]  +  Σ_j  A_{kj} · exp(-(λ - λ_j)² / 2σ_j²)
 ```
 
-A Gaussian Mixture Model (GMM) prior on alpha is added to the training loss to
-discourage unphysical template combinations. Enable with `--neural-templates`.
+A normalizing flow prior on alpha is added during training. The flow learns an
+invertible map from fitted template amplitudes `α` to a Gaussian latent space:
+
+```
+z = f(α),   z ~ N(0, I)
+log p(α) = log p(z) + log |det ∂f/∂α|
+```
+
+This discourages unphysical template combinations while remaining more flexible
+than the previous GMM fit.
 
 ## Requirements
 
@@ -96,7 +104,7 @@ All CLI options:
 | `--zmin` / `--zmax` | 0.4 / 1.1 | Redshift filter and template grid range |
 | `--zmin-loader` / `--zmax-loader` | same as zmin/zmax | Separate loader z cuts |
 | `--desi-target-mask` | none | Bitmask filter on `desi_target` |
-| `--target-noise` | 0 | Add noise to cap SNR at this value (0 = disabled) |
+| `--noise-mult` | 0 | Add noise to cap SNR at this value (0 = disabled) |
 | `--shape-nofz` | off | Rejection-sample to a target n(z) shape |
 | `--nofz-z0` / `--nofz-alpha` / `--nofz-beta` | `0.88 / 40 / 40` | Parameters for `--shape-nofz` |
 | `--Nt` | 5 | Number of templates |
@@ -105,8 +113,9 @@ All CLI options:
 | `--template-res-boost` | 1.0 | Increase template resolution by this factor |
 | `--neural-templates` | off | Use NeuralTemplateModel instead of TemplateModel |
 | `--mlp-hidden` | 64 | MLP hidden width (neural only) |
-| `--gmm-components` | 5 | GMM components for alpha prior (neural only) |
-| `--gmm-weight` | 0.1 | Weight on GMM log-prob in loss (neural only) |
+| `--alpha-flow-layers` | 4 | Number of affine coupling layers in the alpha flow |
+| `--alpha-flow-hidden` | 64 | Hidden width of the alpha-flow conditioner MLP |
+| `--alpha-prior-weight` | 0.1 | Weight on the flow log-prob term in the loss |
 | `--line-noise-init` | 0.01 | Initial noise scale for non-[OII] line amplitudes (neural only) |
 | `--nz-sigma` | 0.4 | Width of the initial n(z) Gaussian; `0` gives uniform init |
 | `--n-epochs` | 20 | Training epochs |
@@ -143,7 +152,7 @@ After training, open `notebooks/analyze.ipynb`. It will:
 The notebook auto-detects checkpoint family from the saved config:
 
 - `TemplateModel` checkpoints store `T`, `log_nz_raw`, and `config`
-- `NeuralTemplateModel` checkpoints store MLP weights, line parameters, GMM parameters, and `config["model_type"] == "neural"`
+- `NeuralTemplateModel` checkpoints store MLP weights, line parameters, flow-prior parameters, and `config["model_type"] == "neural"`
 
 ## Direct Neural Fits
 
@@ -162,7 +171,7 @@ fit metrics.
 py/
   spectra_loader.py        PyTorch Dataset — reads FITS, joins zerr, filters by z / target
   template_model.py        JAX TemplateModel — free-form templates, loss, inference, checkpointing
-  neural_template_model.py JAX NeuralTemplateModel — MLP continuum + explicit lines + GMM prior
+  neural_template_model.py JAX NeuralTemplateModel — MLP continuum + explicit lines + flow prior
   neural_template_fit.py   Helpers for fitting neural templates to saved template checkpoints
 scripts/
   train.py            CLI training script
@@ -176,7 +185,7 @@ notebooks/
 
 - JAX JIT compiles on the first training step; subsequent steps are fast.
 - The first epoch is slower than the rest due to XLA compilation.
-- `--target-noise` modifies spectra on read to cap total SNR. Keep it at `0` in
+- `--noise-mult` modifies spectra on read to cap total SNR. Keep it at `0` in
   analysis unless you explicitly want to evaluate a noise-degraded setting.
 - Templates cover `[wave_min/(1+zmax), wave_max/(1+zmin)]` in rest frame so they
   always overlap the observed range at any z in the search grid.

@@ -89,7 +89,7 @@ class SpectraDataset(Dataset):
         nofz_alpha: float = 40.0,
         nofz_beta: float = 40.0,
         seed: int = 0,
-        target_noise: float = 0.0,
+        noise_mult: float = 0.0,
     ) -> None:
         files = _resolve_files(path)
         if not files:
@@ -142,7 +142,7 @@ class SpectraDataset(Dataset):
 
         self._index = index
         self._has_zerr = zerr_map is not None
-        self._target_noise = target_noise
+        self._noise_mult = noise_mult
         self._noise_seed = seed
 
         # Load the wavelength grid from the first file (identical across files).
@@ -172,8 +172,8 @@ class SpectraDataset(Dataset):
         z = np.float32(cat_row["z"][0])
         desi_target = int(cat_row["desi_target"][0])
 
-        if self._target_noise > 0.0:
-            flux, ivar = _add_noise(flux, ivar, self._target_noise,
+        if self._noise_mult > 0.0:
+            flux, ivar = _add_noise(flux, ivar, self._noise_mult,
                                     np.random.default_rng(self._noise_seed + idx))
 
         item: dict[str, torch.Tensor] = {
@@ -201,7 +201,7 @@ def _load_zerr_map(catalog_path: str) -> dict[int, np.float32]:
 def _add_noise(
     flux: np.ndarray,
     ivar: np.ndarray,
-    snr_goal: float,
+    noise_mult: float,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Add noise to a single spectrum to bring total SNR down to snr_goal.
@@ -211,19 +211,13 @@ def _add_noise(
     ivar is updated to reflect the extra noise.
     """
     snr = float(np.sqrt(np.maximum((flux ** 2 * ivar).sum(), 0.0)))
-    if snr <= snr_goal:
+    if noise_mult <= 1.0:
         return flux, ivar
-    
-    w = ivar > 0
-    if not w.any():
-        return flux, ivar
-    med_ivar = float(np.median(ivar[w]))
-    med_var = 1.0 / med_ivar
-    new_var = med_var * (snr / snr_goal) ** 2
-    diff_var = new_var - med_var
-    flux = flux + rng.standard_normal(flux.shape).astype(np.float32) * np.float32(np.sqrt(diff_var))
+
+    w = ivar > 0    
+    flux[w] = flux[w] + rng.standard_normal(flux[w].shape).astype(np.float32) * np.float32(np.sqrt(1/ivar[w] * (noise_mult**2-1)))
     ivar = ivar.copy()
-    ivar[w] = np.float32(1.0 / (1.0 / ivar[w] + diff_var))
+    ivar[w] /= noise_mult**2
     
     return flux, ivar
 
